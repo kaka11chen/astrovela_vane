@@ -4,6 +4,8 @@ import pytest
 
 import duckdb
 
+pytest.importorskip("pyarrow")
+
 
 class TestArrowDeprecation:
     @pytest.fixture(autouse=True)
