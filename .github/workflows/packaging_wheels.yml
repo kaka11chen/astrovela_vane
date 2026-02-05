@@ -42,7 +42,6 @@ jobs:
         minimal:
           - ${{ inputs.minimal }}
         exclude:
-          - { minimal: true, python: cp310 }
           - { minimal: true, python: cp311 }
           - { minimal: true, python: cp312 }
           - { minimal: true, python: cp313 }
