@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -107,6 +113,15 @@ public:
 	static shared_ptr<DuckDBPyExpression> CaseExpression(const DuckDBPyExpression &condition,
 	                                                     const DuckDBPyExpression &value);
 	static shared_ptr<DuckDBPyExpression> FunctionExpression(const string &function_name, const py::args &args);
+	static shared_ptr<DuckDBPyExpression> UDFMapExpression(const py::function &udf, const string &name,
+	                                                       const shared_ptr<DuckDBPyType> &return_type,
+	                                                       const string &execution_backend, const py::args &args);
+	static shared_ptr<DuckDBPyExpression>
+	UDFMapBatchesExpression(const py::function &udf, const string &name, const py::object &schema,
+	                        const string &execution_backend, const vector<string> &input_names,
+	                        const Optional<py::object> &batch_size, bool row_preserving,
+	                        const Optional<py::object> &gpus, const Optional<py::object> &actor_number, bool stateful,
+	                        const py::args &args);
 	static shared_ptr<DuckDBPyExpression> Coalesce(const py::args &args);
 	static shared_ptr<DuckDBPyExpression> SQLExpression(string sql);
 

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Modified by Vane contributors.
+
 #include "duckdb_python/pytype.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/exception.hpp"
@@ -355,6 +361,13 @@ void DuckDBPyType::Initialize(py::handle &m) {
 	type_module.def("__getattr__", &DuckDBPyType::GetAttribute, "Get the child type by 'name'", py::arg("name"));
 	type_module.def("__getitem__", &DuckDBPyType::GetAttribute, "Get the child type by 'name'", py::arg("name"),
 	                py::is_operator());
+	type_module.def(py::pickle([](const DuckDBPyType &type) { return py::make_tuple(type.ToString()); },
+	                           [](py::tuple state) {
+		                           if (state.size() != 1) {
+			                           throw py::value_error("Invalid DuckDBPyType pickle state");
+		                           }
+		                           return DuckDBPyType(FromString(state[0].cast<string>(), nullptr));
+	                           }));
 
 	py::implicitly_convertible<py::object, DuckDBPyType>();
 	py::implicitly_convertible<py::str, DuckDBPyType>();
@@ -367,6 +380,17 @@ string DuckDBPyType::ToString() const {
 }
 
 py::list DuckDBPyType::Children() const {
+	if (TensorType::IsTensor(type)) {
+		py::list children;
+		children.append(py::make_tuple("dtype", make_shared_ptr<DuckDBPyType>(TensorType::GetChildType(type))));
+		py::tuple shape(TensorType::GetShape(type).size());
+		auto tensor_shape = TensorType::GetShape(type);
+		for (idx_t i = 0; i < tensor_shape.size(); i++) {
+			shape[i] = py::int_(tensor_shape[i]);
+		}
+		children.append(py::make_tuple("shape", shape));
+		return children;
+	}
 
 	switch (type.id()) {
 	case LogicalTypeId::LIST:
@@ -425,6 +449,9 @@ py::list DuckDBPyType::Children() const {
 }
 
 string DuckDBPyType::GetId() const {
+	if (TensorType::IsTensor(type)) {
+		return "tensor";
+	}
 	return StringUtil::Lower(LogicalTypeIdToString(type.id()));
 }
 

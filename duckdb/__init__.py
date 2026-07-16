@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 # ruff: noqa: F401
 """The DuckDB Python Package.
 
@@ -141,6 +147,7 @@ from _duckdb import (
     struct_type,
     table,
     table_function,
+    tensor_type,
     tf,
     threadsafety,
     to_arrow_reader,
@@ -373,6 +380,7 @@ __all__: list[str] = [
     "struct_type",
     "table",
     "table_function",
+    "tensor_type",
     "tf",
     "threadsafety",
     "threadsafety",

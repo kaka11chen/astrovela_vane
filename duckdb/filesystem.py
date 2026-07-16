@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 """In-memory filesystem to store ephemeral dependencies.
 
 Warning: Not for external use. May change at any moment. Likely to be made internal.
@@ -17,7 +23,7 @@ from .bytes_io_wrapper import BytesIOWrapper
 class ModifiedMemoryFileSystem(MemoryFileSystem):
     """In-memory filesystem implementation that uses its own protocol."""
 
-    protocol = ("DUCKDB_INTERNAL_OBJECTSTORE",)
+    protocol = ("VANE_INTERNAL_OBJECTSTORE",)
     # defer to the original implementation that doesn't hardcode the protocol
     _strip_protocol: typing.Callable[[str], str] = classmethod(AbstractFileSystem._strip_protocol.__func__)  # type: ignore[assignment]
 

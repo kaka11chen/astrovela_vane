@@ -1,4 +1,9 @@
-import logging
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import sys
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
@@ -12,8 +17,6 @@ from duckdb import DuckDBPyConnection, InvalidInputException
 fsspec = pytest.importorskip("fsspec", "2022.11.0")
 
 FILENAME = "integers.csv"
-
-logging.basicConfig(level=logging.DEBUG)
 
 
 def intercept(monkeypatch: pytest.MonkeyPatch, obj: object, name: str) -> list[str]:

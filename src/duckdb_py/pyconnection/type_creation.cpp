@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Modified by Vane contributors.
+
 #include "duckdb_python/pyconnection/pyconnection.hpp"
 
 namespace duckdb {
@@ -16,6 +22,29 @@ shared_ptr<DuckDBPyType> DuckDBPyConnection::ListType(const shared_ptr<DuckDBPyT
 shared_ptr<DuckDBPyType> DuckDBPyConnection::ArrayType(const shared_ptr<DuckDBPyType> &type, idx_t size) {
 	auto array_type = LogicalType::ARRAY(type->Type(), size);
 	return make_shared_ptr<DuckDBPyType>(array_type);
+}
+
+static vector<idx_t> ParseTensorShapeObject(const py::object &shape_obj) {
+	if (shape_obj.is_none()) {
+		throw InvalidInputException("tensor_type requires a non-empty shape");
+	}
+	vector<idx_t> shape;
+	for (auto &item : shape_obj) {
+		auto dim = py::cast<int64_t>(item);
+		if (dim <= 0) {
+			throw InvalidInputException("tensor_type shape dimensions must be positive, got %lld", (long long)dim);
+		}
+		shape.push_back(NumericCast<idx_t>(dim));
+	}
+	if (shape.empty()) {
+		throw InvalidInputException("tensor_type requires a non-empty shape");
+	}
+	return shape;
+}
+
+shared_ptr<DuckDBPyType> DuckDBPyConnection::TensorType(const shared_ptr<DuckDBPyType> &type, const py::object &shape) {
+	auto tensor_type = duckdb::TensorType::Create(type->Type(), ParseTensorShapeObject(shape));
+	return make_shared_ptr<DuckDBPyType>(tensor_type);
 }
 
 static child_list_t<LogicalType> GetChildList(const py::object &container) {
@@ -37,7 +66,7 @@ static child_list_t<LogicalType> GetChildList(const py::object &container) {
 		for (auto &item : fields) {
 			auto &name_p = item.first;
 			auto &type_p = item.second;
-			string name = py::str(name_p);
+			string name = py::cast<string>(name_p);
 			shared_ptr<DuckDBPyType> pytype;
 			if (!py::try_cast<shared_ptr<DuckDBPyType>>(type_p, pytype)) {
 				string actual_type = py::str(py::type::of(type_p));

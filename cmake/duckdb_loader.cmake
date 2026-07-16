@@ -1,3 +1,11 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+#
+# SPDX-FileCopyrightText: 2026 Vane contributors
+#
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 # cmake/duckdb_loader.cmake
 #
 # Simple DuckDB Build Configuration Module
@@ -35,7 +43,7 @@ _duckdb_set_default(DUCKDB_SOURCE_PATH
                     "${CMAKE_CURRENT_SOURCE_DIR}/external/duckdb")
 
 # Extension list - commonly used extensions for Python
-_duckdb_set_default(BUILD_EXTENSIONS "core_functions;parquet;icu;json")
+_duckdb_set_default(BUILD_EXTENSIONS "core_functions;parquet;icu;json;httpfs")
 
 # Core build options - disable unnecessary components for Python builds
 _duckdb_set_default(BUILD_SHELL OFF)
@@ -157,8 +165,8 @@ endfunction()
 function(_duckdb_create_interface_target target_name)
   add_library(${target_name} INTERFACE)
 
-  # Include directories to deal with leaking 3rd party headers in duckdb headers
-  # See https://github.com/duckdblabs/duckdb-internal/issues/5084
+  # Include directories to deal with leaking third-party headers in DuckDB
+  # headers.
   target_include_directories(
     ${target_name}
     INTERFACE

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Modified by Vane contributors.
+
 #include "duckdb_python/numpy/numpy_type.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/to_string.hpp"
@@ -55,7 +61,7 @@ static NumpyNullableType ConvertNumpyTypeInternal(const string &col_type_str) {
 	if (col_type_str == "float64" || col_type_str == "Float64") {
 		return NumpyNullableType::FLOAT_64;
 	}
-	if (col_type_str == "string") {
+	if (col_type_str == "string" || col_type_str == "str" || StringUtil::StartsWith(col_type_str, "string[")) {
 		return NumpyNullableType::STRING;
 	}
 	if (col_type_str == "str") {

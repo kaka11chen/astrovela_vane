@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Modified by Vane contributors.
+
 #include "duckdb_python/pybind11/pybind_wrapper.hpp"
 #include "duckdb_python/expression/pyexpression.hpp"
 #include "duckdb/common/helper.hpp"
@@ -33,6 +39,15 @@ void InitializeStaticMethods(py::module_ &m) {
 	// Function Expression
 	docs = "";
 	m.def("FunctionExpression", &DuckDBPyExpression::FunctionExpression, py::arg("function_name"), docs);
+
+	// Vane Python UDF Expression builders
+	docs = "";
+	m.def("_VaneUDFMapExpression", &DuckDBPyExpression::UDFMapExpression, py::arg("function"), py::arg("name"),
+	      py::arg("return_type"), py::arg("execution_backend"), docs);
+	m.def("_VaneUDFMapBatchesExpression", &DuckDBPyExpression::UDFMapBatchesExpression, py::arg("function"),
+	      py::arg("name"), py::arg("schema"), py::arg("execution_backend"), py::arg("input_names"),
+	      py::arg("batch_size") = py::none(), py::arg("row_preserving") = false, py::arg("gpus") = py::none(),
+	      py::arg("actor_number") = py::none(), py::arg("stateful") = false, docs);
 
 	// Coalesce Operator
 	docs = "";

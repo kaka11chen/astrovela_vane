@@ -1,4 +1,11 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Modified by Vane contributors.
+
 #include "duckdb_python/arrow/arrow_array_stream.hpp"
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
 
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/common.hpp"
@@ -19,7 +26,7 @@ namespace pyarrow {
 
 py::object ToArrowTable(const vector<LogicalType> &types, const vector<string> &names, const py::list &batches,
                         ClientProperties &options) {
-	py::gil_scoped_acquire acquire;
+	PythonGILWrapper acquire;
 
 	auto pyarrow_lib_module = py::module::import("pyarrow").attr("lib");
 	auto from_batches_func = pyarrow_lib_module.attr("Table").attr("from_batches");

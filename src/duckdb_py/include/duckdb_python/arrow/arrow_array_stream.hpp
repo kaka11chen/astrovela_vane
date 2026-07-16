@@ -1,4 +1,11 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
 //                         DuckDB
 //
 // duckdb_python/arrow/arrow_array_stream.hpp
@@ -76,7 +83,7 @@ public:
 
 	~PythonTableArrowArrayStreamFactory() {
 		if (cached_arrow_table.ptr() != nullptr) {
-			py::gil_scoped_acquire acquire;
+			PythonGILWrapper acquire;
 			cached_arrow_table = py::object();
 		}
 		if (cached_schema.release) {

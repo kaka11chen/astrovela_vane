@@ -1,6 +1,13 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Modified by Vane contributors.
+
 #include "duckdb_python/jupyter_progress_bar_display.hpp"
 #include "duckdb_python/pyconnection/pyconnection.hpp"
 #include "duckdb_python/pybind11/pybind_wrapper.hpp"
+#include "duckdb_python/pybind11/gil_wrapper.hpp"
 
 namespace duckdb {
 
@@ -30,7 +37,7 @@ JupyterProgressBarDisplay::JupyterProgressBarDisplay() : ProgressBarDisplay() {
 }
 
 void JupyterProgressBarDisplay::Update(double progress) {
-	py::gil_scoped_acquire gil;
+	PythonGILWrapper gil;
 	if (progress_bar.ptr() == nullptr) {
 		// First print, we first need to initialize the display
 		Initialize();

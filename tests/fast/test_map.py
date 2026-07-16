@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import re
 from datetime import date, timedelta
 from typing import NoReturn
@@ -115,6 +121,29 @@ class TestMap:
         # when the dataframe is empty, this results in NULL, which is not desirable
         # in this case we assume the returned type should be the same as the input type
         duckdb_cursor.values([b"1234"]).map(return_with_no_modification).fetchall()
+
+    def test_map_batches_basic(self, duckdb_cursor):
+        rel = duckdb_cursor.sql("select i from range(5) tbl(i)")
+
+        def udf(table):
+            import pyarrow as pa
+
+            values = table.column(0).to_pylist()
+            return pa.table({"x": [v * 2 for v in values]})
+
+        result = rel.map_batches(udf, schema={"x": duckdb.sqltype("INTEGER")}).fetchall()
+        assert result == [(0,), (2,), (4,), (6,), (8,)]
+
+    def test_create_table_function_map_batches(self, duckdb_cursor):
+        def udf(table):
+            import pyarrow as pa
+
+            values = table.column(0).to_pylist()
+            return pa.table({"x": [v * 3 for v in values]})
+
+        duckdb_cursor.create_table_function("map_batches_test", udf, schema={"x": duckdb.sqltype("INTEGER")})
+        result = duckdb_cursor.sql("select * from map_batches_test((select i from range(3) tbl(i)))").fetchall()
+        assert result == [(0,), (3,), (6,)]
 
     def test_isse_3237(self, duckdb_cursor):
         def process(rel):
