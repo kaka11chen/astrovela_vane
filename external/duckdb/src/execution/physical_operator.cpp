@@ -136,30 +136,6 @@ static unique_ptr<DataChunk> MakeEmptyExecutionBatchChunk(ClientContext &context
 	return chunk;
 }
 
-static unique_ptr<DataChunk> TakeMaterializedExecutionBatch(ClientContext &context, ExecutionBatch &batch,
-                                                            const vector<LogicalType> &types, const char *reason) {
-	if (batch.kind == ExecutionBatchKind::MATERIALIZED_CHUNK) {
-		if (batch.materialized) {
-			return std::move(batch.materialized);
-		}
-		return MakeEmptyExecutionBatchChunk(context, types);
-	}
-	if (batch.kind == ExecutionBatchKind::LAZY_DATA_CHUNK) {
-		if (!batch.lazy) {
-			return MakeEmptyExecutionBatchChunk(context, types);
-		}
-		auto barrier = MaterializeExternalBlockBarrier(context, *batch.lazy, reason ? string(reason) : string());
-		auto chunk = std::move(barrier.chunk);
-		// Once a lazy batch has been materialized, the returned DataChunk owns the
-		// materialized Arrow buffers. Drop the original descriptors immediately so
-		// their budget tickets do not artificially hold upstream ref-bundle
-		// backpressure while the downstream operator processes the chunk.
-		batch = ExecutionBatch();
-		return chunk;
-	}
-	throw InternalException("unsupported ExecutionBatch kind");
-}
-
 static void StoreMaterializedExecutionBatch(ExecutionBatch &batch, unique_ptr<DataChunk> chunk) {
 	batch = ExecutionBatch();
 	batch.kind = ExecutionBatchKind::MATERIALIZED_CHUNK;
@@ -168,6 +144,40 @@ static void StoreMaterializedExecutionBatch(ExecutionBatch &batch, unique_ptr<Da
 		batch.estimated_bytes = chunk->GetAllocationSize();
 	}
 	batch.materialized = std::move(chunk);
+}
+
+static DataChunk &MaterializeExecutionBatch(ClientContext &context, ExecutionBatch &batch,
+                                            const vector<LogicalType> &types, const char *reason) {
+	if (batch.kind == ExecutionBatchKind::MATERIALIZED_CHUNK) {
+		if (!batch.materialized) {
+			if (batch.rows > 0) {
+				throw InternalException("materialized ExecutionBatch has %llu rows but no payload", batch.rows);
+			}
+			StoreMaterializedExecutionBatch(batch, MakeEmptyExecutionBatchChunk(context, types));
+		}
+		return *batch.materialized;
+	}
+	if (batch.kind == ExecutionBatchKind::LAZY_DATA_CHUNK) {
+		if (!batch.lazy) {
+			if (batch.rows > 0) {
+				throw InternalException("lazy ExecutionBatch has %llu rows but no payload", batch.rows);
+			}
+			StoreMaterializedExecutionBatch(batch, MakeEmptyExecutionBatchChunk(context, types));
+			return *batch.materialized;
+		}
+		auto barrier = MaterializeExternalBlockBarrier(context, *batch.lazy, reason ? string(reason) : string());
+		// Once a lazy batch has been materialized, the returned DataChunk owns the
+		// materialized Arrow buffers. Drop the original descriptors immediately so
+		// their budget tickets do not artificially hold upstream ref-bundle
+		// backpressure while the downstream operator processes the chunk. Keep the
+		// materialized payload in the batch so a BLOCKED operator can retry it.
+		StoreMaterializedExecutionBatch(batch, std::move(barrier.chunk));
+		if (!batch.materialized) {
+			throw InternalException("materializing lazy ExecutionBatch produced no payload");
+		}
+		return *batch.materialized;
+	}
+	throw InternalException("unsupported ExecutionBatch kind");
 }
 
 } // namespace
@@ -260,10 +270,10 @@ OperatorResultType PhysicalOperator::ExecuteBatch(ExecutionContext &context, Exe
                                                   OperatorState &state) const {
 	auto input_types = children.empty() ? vector<LogicalType>() : children[0].get().GetTypes();
 	auto barrier_reason = GetName();
-	auto input_chunk = TakeMaterializedExecutionBatch(context.client, input, input_types, barrier_reason.c_str());
+	auto &input_chunk = MaterializeExecutionBatch(context.client, input, input_types, barrier_reason.c_str());
 	auto output_chunk = make_uniq<DataChunk>();
 	output_chunk->Initialize(BufferAllocator::Get(context.client), types);
-	auto result = Execute(context, *input_chunk, *output_chunk, gstate, state);
+	auto result = Execute(context, input_chunk, *output_chunk, gstate, state);
 	StoreMaterializedExecutionBatch(output, std::move(output_chunk));
 	return result;
 }
@@ -346,8 +356,8 @@ SinkResultType PhysicalOperator::SinkBatch(ExecutionContext &context, ExecutionB
                                            OperatorSinkInput &input) const {
 	auto input_types = children.empty() ? vector<LogicalType>() : children[0].get().GetTypes();
 	auto barrier_reason = GetName();
-	auto chunk = TakeMaterializedExecutionBatch(context.client, batch, input_types, barrier_reason.c_str());
-	return Sink(context, *chunk, input);
+	auto &chunk = MaterializeExecutionBatch(context.client, batch, input_types, barrier_reason.c_str());
+	return Sink(context, chunk, input);
 }
 
 // LCOV_EXCL_STOP

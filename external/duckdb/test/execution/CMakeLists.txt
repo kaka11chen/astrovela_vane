@@ -4,6 +4,9 @@
 
 option(BUILD_DISTRIBUTED "Build the distributed execution tests" ON)
 
+add_library_unity(test_execution OBJECT test_execution_batch.cpp)
+set(ALL_OBJECT_FILES ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:test_execution>)
+
 if(BUILD_DISTRIBUTED)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/distributed)
     add_subdirectory(distributed)

@@ -30,7 +30,7 @@ the former `AstroVela/duckdb` commit
 `398033a962719ac09868f4484ec4f97353bb0325`, whose sole parent is the official
 baseline above. Its Vane commit message records both original revisions, so the
 custom source, authorship, and provenance remain available even if that fork is
-retired. The resulting engine tree is described as `v1.5.0-1-g398033a962`.
+retired. The resulting engine tree is described as `v1.5.0-2-ge2d3989890`.
 Source archives do not contain Git metadata, so the same description is passed
 through `OVERRIDE_GIT_DESCRIBE` in `pyproject.toml`. A change to the engine
 source must update both records in the same pull request. Release reviews must

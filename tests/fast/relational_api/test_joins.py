@@ -1,7 +1,25 @@
+from collections import Counter
+from itertools import product
+
 import pytest
 
 import duckdb
 from duckdb import ColumnExpression
+
+STANDARD_VECTOR_SIZE = 2048
+CROSS_JOIN_BOUNDARY_CASES = (
+    (1, 1),
+    (2, 1),
+    (1, 2),
+    (3, 5),
+    (10, 10),
+    (STANDARD_VECTOR_SIZE, 2),
+    (2, STANDARD_VECTOR_SIZE),
+    (STANDARD_VECTOR_SIZE + 1, 2),
+    (2, STANDARD_VECTOR_SIZE + 1),
+    (2 * STANDARD_VECTOR_SIZE + 17, 3),
+    (3, 2 * STANDARD_VECTOR_SIZE + 17),
+)
 
 
 @pytest.fixture
@@ -86,3 +104,34 @@ class TestRAPIJoins:
         rel = a.cross(b)
         res = rel.fetchall()
         assert res == [(1, 1, 1, 4), (2, 1, 1, 4), (3, 2, 1, 4), (1, 1, 3, 5), (2, 1, 3, 5), (3, 2, 3, 5)]
+
+    @pytest.mark.parametrize("threads", [1, 4])
+    @pytest.mark.parametrize("left_count,right_count", CROSS_JOIN_BOUNDARY_CASES)
+    def test_cross_join_vector_boundaries(self, con, threads, left_count, right_count):
+        con.execute(f"SET threads={threads}")
+        left = con.sql(f"SELECT range AS left_value FROM range({left_count})")
+        right = con.sql(f"SELECT range AS right_value FROM range({right_count})")
+
+        rows = left.cross(right).fetchall()
+        expected_count = left_count * right_count
+        expected_rows = Counter(product(range(left_count), range(right_count)))
+
+        assert len(rows) == expected_count
+        assert Counter(rows) == expected_rows
+        assert left.cross(right).aggregate("count(*)").fetchone() == (expected_count,)
+        assert con.execute(
+            f"SELECT count(*) FROM range({left_count}) l CROSS JOIN range({right_count}) r"
+        ).fetchone() == (expected_count,)
+
+    @pytest.mark.parametrize("threads", [1, 4])
+    def test_cross_join_preserves_null_multiset(self, con, threads):
+        con.execute(f"SET threads={threads}")
+        left = con.sql("SELECT * FROM (VALUES (1), (NULL), (1)) AS left_values(value)")
+        right = con.sql("SELECT * FROM (VALUES (10), (NULL)) AS right_values(value)")
+
+        rows = left.cross(right).fetchall()
+        expected_rows = Counter(product((1, None, 1), (10, None)))
+
+        assert len(rows) == 6
+        assert Counter(rows) == expected_rows
+        assert left.cross(right).aggregate("count(*)").fetchone() == (6,)
