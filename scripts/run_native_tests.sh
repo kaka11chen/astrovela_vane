@@ -26,6 +26,14 @@ if [[ ! "$build_jobs" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 generator="${VANE_NATIVE_CMAKE_GENERATOR:-Ninja}"
+case "$generator" in
+  *"Multi-Config"* | "Green Hills MULTI" | Xcode | Visual\ Studio*)
+    echo "Multi-config CMake generators are not supported by this script (Release single-config expected): $generator" >&2
+    echo "Set VANE_NATIVE_CMAKE_GENERATOR to a single-config generator such as 'Ninja'." >&2
+    exit 2
+    ;;
+esac
+
 cmake_args=(
   -DCMAKE_BUILD_TYPE=Release
   -DCMAKE_CXX_STANDARD=20
