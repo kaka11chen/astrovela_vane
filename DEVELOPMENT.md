@@ -82,9 +82,15 @@ Some tests require network access, model weights, GPUs, credentials, or a local 
 
 ```bash
 python -m pip install pre-commit
+pre-commit install
 scripts/format root --changed
+python scripts/sync_duckdb_source_id.py --check
 pre-commit run --from-ref origin/main --to-ref HEAD
 ```
+
+Run `pre-commit install` once per clone. The installed commit hook repairs
+`DUCKDB_SOURCE_ID` from the staged DuckDB tree; the explicit check above also
+covers clean range-based runs, where the Git index has no staged changes.
 
 The root formatter deliberately excludes `external/duckdb`. Format DuckDB subtree changes with:
 

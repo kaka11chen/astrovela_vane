@@ -32,10 +32,12 @@ snapshot. The former `AstroVela/duckdb` history maps to Vane as follows:
 | `398033a962719ac09868f4484ec4f97353bb0325` | `3a3967aa8190d0a2d1931d4ca4f5d920760030b4` | `57d4e3c166e307c19b28cb1bb2ea7ebd2283a030` |
 | `e2d398989076fa3c6c3859e77310e5e50608b168` | `398033a962719ac09868f4484ec4f97353bb0325` | `74f8d91976c69d8861262944eb61f4b8a05abd42` |
 
-The former fork is not used for builds or engine identity. It must not be
-deleted until a bundle ending at `e2d398989076fa3c6c3859e77310e5e50608b168`
-has been placed in durable storage and its public location and SHA-256 have
-been recorded here.
+The former fork is not used for builds or engine identity. Vane intentionally
+does not retain a bundle or other archive of its Git objects. The identifiers
+above are kept only as a historical mapping; maintained customization history
+is the corresponding Vane commits, and the official baseline history remains
+in `duckdb/duckdb`. The former fork may therefore be deleted without an
+archival prerequisite.
 
 At Vane commit `74f8d91976c69d8861262944eb61f4b8a05abd42`, the
 DuckDB-rooted subtree history is described as `v1.5.0-2-g55abe0cb9e`. That

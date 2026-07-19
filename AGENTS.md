@@ -16,7 +16,8 @@ uv pip install . --no-build-isolation
 
 DuckDB and workspace formatting automatically synchronize the content-derived
 `DUCKDB_SOURCE_ID`. The pre-commit hook also repairs it from the staged DuckDB
-tree if formatting was skipped; CI rejects an out-of-date value.
+tree if formatting was skipped; install that hook once per clone with
+`pre-commit install`. CI rejects an out-of-date value.
 
 ## Formatting
 
