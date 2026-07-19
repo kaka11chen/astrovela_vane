@@ -243,18 +243,20 @@ def test_timeout():
 def _ray_local_cluster():
     try:
         import ray
-        from ray._private.resource_and_label_spec import ResourceAndLabelSpec
-        from ray.cluster_utils import Cluster
-    except Exception:
+    except ModuleNotFoundError as exc:
+        if exc.name != "ray":
+            raise
         pytest.skip("ray not installed")
+
+    from ray._private.resource_and_label_spec import ResourceAndLabelSpec
+    from ray.cluster_utils import Cluster
 
     cluster = Cluster()
     try:
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=r"Tip: In future versions of Ray")
             warning_filter = r"ignore:\s*Prefer using device seq_lens directly.*:DeprecationWarning"
-            os.environ["PYTHONWARNINGS"] = warning_filter
-            os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
+            accelerator_override = os.environ.get("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
             pythonpath = os.environ.get("PYTHONPATH", "")
             try:
                 import _duckdb as duckdb_ext
@@ -270,13 +272,11 @@ def _ray_local_cluster():
                 if pythonpath:
                     pythonpath_entries.append(pythonpath)
                 pythonpath = os.pathsep.join(dict.fromkeys(pythonpath_entries))
-                if pythonpath:
-                    os.environ["PYTHONPATH"] = pythonpath
             except Exception:
                 pythonpath = os.environ.get("PYTHONPATH", "")
             env_vars = {
-                "PYTHONWARNINGS": os.environ.get("PYTHONWARNINGS", ""),
-                "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": os.environ.get("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0"),
+                "PYTHONWARNINGS": warning_filter,
+                "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": accelerator_override,
             }
             if pythonpath:
                 env_vars["PYTHONPATH"] = pythonpath
@@ -285,13 +285,18 @@ def _ray_local_cluster():
             # long-lived pytest process that can fail with ENOMEM even after the
             # preceding cluster was shut down. Tests still reconnect as independent
             # Ray jobs through the function-scoped fixture below.
-            resources = ResourceAndLabelSpec().resolve(is_head=True)
-            cluster.add_node(
-                include_dashboard=False,
-                num_cpus=resources.num_cpus,
-                num_gpus=resources.num_gpus,
-                object_store_memory=int(os.environ.get("VANE_TEST_RAY_OBJECT_STORE_BYTES", str(1024**3))),
-            )
+            # Let Ray's node processes inherit the job environment, then restore
+            # the pytest process before any test body or unrelated subprocess runs.
+            with pytest.MonkeyPatch.context() as monkeypatch:
+                for name, value in env_vars.items():
+                    monkeypatch.setenv(name, value)
+                resources = ResourceAndLabelSpec().resolve(is_head=True)
+                cluster.add_node(
+                    include_dashboard=False,
+                    num_cpus=resources.num_cpus,
+                    num_gpus=resources.num_gpus,
+                    object_store_memory=int(os.environ.get("VANE_TEST_RAY_OBJECT_STORE_BYTES", str(1024**3))),
+                )
 
         yield ray, cluster.address, env_vars
     finally:
