@@ -116,7 +116,7 @@ exclude = [
 BUILD_EXTENSIONS = "core_functions;json;parquet;icu;jemalloc;httpfs"
 # Source archives have no Git metadata. Keep DuckDB's embedded version stable
 # and update this value whenever the engine source revision changes.
-OVERRIDE_GIT_DESCRIBE = "v1.5.0-1-g398033a962"
+OVERRIDE_GIT_DESCRIBE = "v1.5.0-2-ge2d3989890"
 
 # Override: if COVERAGE is set then:
 # - we create a RelWithDebInfo build
