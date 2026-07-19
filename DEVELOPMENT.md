@@ -46,8 +46,8 @@ Python-only changes do not require a native rebuild. Changes below `src/duckdb_p
 
 The complete native gate builds DuckDB, distributed exchange, and the test
 runner with the same pinned Arrow and C++20 configuration used by CI. The
-script starts from a fresh CMake configuration while preserving unchanged
-compiled objects in its build directory:
+script starts from a fresh CMake configuration (`cmake --fresh`) to avoid
+configuration drift, which triggers a clean rebuild in its build directory:
 
 ```bash
 scripts/run_native_tests.sh "[distributed]"
