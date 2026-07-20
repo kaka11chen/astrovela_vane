@@ -18,7 +18,9 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIRECTORY = "external/duckdb"
+ARCHIVE_METADATA_PATH = ".git_archival.txt"
 GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+ARCHIVE_COMMIT_ID = re.compile(r"^commit: ([0-9a-f]{40}|[0-9a-f]{64})$", re.MULTILINE)
 
 
 def _git(*args: str, env: dict[str, str] | None = None) -> str:
@@ -33,9 +35,36 @@ def _git(*args: str, env: dict[str, str] | None = None) -> str:
     return result.stdout.strip()
 
 
+def _git_bytes(*args: str, env: dict[str, str] | None = None) -> bytes:
+    result = subprocess.run(
+        ("git", *args),
+        cwd=REPOSITORY_ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+    return result.stdout
+
+
 def _git_path(name: str) -> Path:
     path = Path(_git("rev-parse", "--git-path", name))
     return path if path.is_absolute() else REPOSITORY_ROOT / path
+
+
+def _clear_index_suppression(environment: dict[str, str]) -> None:
+    tracked_paths = _git_bytes("ls-files", "-z", "--cached", "--", SOURCE_DIRECTORY, env=environment)
+    if not tracked_paths:
+        return
+    # update-index applies only one flag operation per invocation.
+    for flag in ("--no-assume-unchanged", "--no-skip-worktree"):
+        subprocess.run(
+            ("git", "update-index", flag, "-z", "--stdin"),
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            input=tracked_paths,
+            check=True,
+            capture_output=True,
+        )
 
 
 def _write_tree(environment: dict[str, str], temporary_index: Path) -> str:
@@ -48,6 +77,8 @@ def _write_tree(environment: dict[str, str], temporary_index: Path) -> str:
         _git("read-tree", "HEAD", env=environment)
 
     try:
+        if copied_index:
+            _clear_index_suppression(environment)
         _git("add", "-A", "--", SOURCE_DIRECTORY, env=environment)
         return _git("write-tree", env=environment)
     except subprocess.CalledProcessError:
@@ -80,15 +111,21 @@ def _git_top_level() -> Path | None:
     return Path(result.stdout.strip()).resolve()
 
 
-def _object_hash(object_type: bytes, contents: bytes) -> bytes:
-    hasher = hashlib.sha1(usedforsecurity=False)
+def _new_hasher(object_format: str):
+    if object_format not in {"sha1", "sha256"}:
+        raise ValueError(f"unsupported Git object format: {object_format!r}")
+    return hashlib.new(object_format, usedforsecurity=False)
+
+
+def _object_hash(object_format: str, object_type: bytes, contents: bytes) -> bytes:
+    hasher = _new_hasher(object_format)
     hasher.update(object_type + b" " + str(len(contents)).encode("ascii") + b"\0")
     hasher.update(contents)
     return hasher.digest()
 
 
-def _file_hash(path: Path, size: int) -> bytes:
-    hasher = hashlib.sha1(usedforsecurity=False)
+def _file_hash(path: Path, size: int, object_format: str) -> bytes:
+    hasher = _new_hasher(object_format)
     hasher.update(b"blob " + str(size).encode("ascii") + b"\0")
     bytes_read = 0
     with path.open("rb") as source_file:
@@ -100,7 +137,7 @@ def _file_hash(path: Path, size: int) -> bytes:
     return hasher.digest()
 
 
-def _filesystem_tree_hash(directory: Path) -> bytes:
+def _filesystem_tree_hash(directory: Path, object_format: str) -> bytes:
     entries: list[tuple[bytes, bytes]] = []
     with os.scandir(directory) as children:
         for child in children:
@@ -109,30 +146,41 @@ def _filesystem_tree_hash(directory: Path) -> bytes:
             metadata = child.stat(follow_symlinks=False)
             if stat.S_ISLNK(metadata.st_mode):
                 mode = b"120000"
-                object_id = _object_hash(b"blob", os.fsencode(os.readlink(child.path)))
+                object_id = _object_hash(object_format, b"blob", os.fsencode(os.readlink(child.path)))
                 sort_name = name
             elif stat.S_ISDIR(metadata.st_mode):
                 mode = b"40000"
-                object_id = _filesystem_tree_hash(path)
+                object_id = _filesystem_tree_hash(path, object_format)
                 sort_name = name + b"/"
             elif stat.S_ISREG(metadata.st_mode):
                 mode = b"100755" if metadata.st_mode & stat.S_IXUSR else b"100644"
-                object_id = _file_hash(path, metadata.st_size)
+                object_id = _file_hash(path, metadata.st_size, object_format)
                 sort_name = name
             else:
                 raise RuntimeError(f"unsupported file type in DuckDB source tree: {path}")
             entries.append((sort_name, mode + b" " + name + b"\0" + object_id))
 
     contents = b"".join(entry for _, entry in sorted(entries))
-    return _object_hash(b"tree", contents)
+    return _object_hash(object_format, b"tree", contents)
 
 
-def filesystem_tree_id(source_path: Path | None = None) -> str:
+def _archive_object_format() -> str:
+    metadata_path = REPOSITORY_ROOT / ARCHIVE_METADATA_PATH
+    try:
+        metadata = metadata_path.read_text(encoding="ascii")
+    except OSError:
+        return "sha1"
+    match = ARCHIVE_COMMIT_ID.search(metadata)
+    return "sha256" if match is not None and len(match.group(1)) == 64 else "sha1"
+
+
+def filesystem_tree_id(source_path: Path | None = None, *, object_format: str | None = None) -> str:
     """Return a Git-compatible tree ID when repository metadata is absent."""
     source_path = REPOSITORY_ROOT / SOURCE_DIRECTORY if source_path is None else source_path
     if not source_path.is_dir():
         raise RuntimeError(f"DuckDB source directory is unavailable: {source_path}")
-    return _filesystem_tree_hash(source_path).hex()
+    object_format = _archive_object_format() if object_format is None else object_format
+    return _filesystem_tree_hash(source_path, object_format).hex()
 
 
 def source_tree_id() -> str:

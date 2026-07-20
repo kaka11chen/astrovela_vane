@@ -52,16 +52,18 @@ a generated header in the CMake binary directory. The external tree is a CMake
 configuration dependency, so direct Ninja and Makefile builds refresh all
 configure-time version metadata before compiling changed engine sources. When
 Git metadata and a source-distribution manifest are absent, the script derives
-the same Git-compatible object encoding from the materialized tree. The PEP 517
-backend injects the full `DUCKDB_SOURCE_ID` manifest into source distributions
-without modifying the checkout, so subsequent builds without Git metadata
-retain the same identity. The tree object depends on engine paths, modes,
-symlinks, and contents rather than commit topology, so rebases and squash merges
-do not change the SourceID. Ordinary engine changes require no tracked identity
-update. Changes to the upstream baseline, DuckDB version line, or historical
-mapping must update this document and `OVERRIDE_GIT_DESCRIBE`. Release reviews
-must record the full tree ID and inspect subsequent Vane engine commits since
-the previously released state.
+the same Git-compatible object encoding from the materialized tree. The constant
+`.git_archival.txt` export template records whether that encoding uses SHA-1 or
+SHA-256 without introducing a generated identity file that changes in normal
+commits. The PEP 517 backend injects the full `DUCKDB_SOURCE_ID` manifest into
+source distributions without modifying the checkout, so subsequent builds
+without Git metadata retain the same identity. The tree object depends on
+engine paths, modes, symlinks, and contents rather than commit topology, so
+rebases and squash merges do not change the SourceID. Ordinary engine changes
+require no tracked identity update. Changes to the upstream baseline, DuckDB
+version line, or historical mapping must update this document and
+`OVERRIDE_GIT_DESCRIBE`. Release reviews must record the full tree ID and inspect
+subsequent Vane engine commits since the previously released state.
 
 The statically linked DuckDB HTTPFS extension is fetched separately during the
 native build and pinned to commit

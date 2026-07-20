@@ -191,9 +191,7 @@ function(_duckdb_resolve_source_id)
       message(FATAL_ERROR "Unable to compute the DuckDB source tree ID: "
                           "${_VANE_DUCKDB_SOURCE_ID_ERROR}")
     endif()
-    if(EXISTS "${PROJECT_SOURCE_DIR}/.git")
-      set(_VANE_DUCKDB_SOURCE_ID_DYNAMIC TRUE)
-    endif()
+    set(_VANE_DUCKDB_SOURCE_ID_DYNAMIC TRUE)
   else()
     message(
       FATAL_ERROR
@@ -270,10 +268,10 @@ function(_duckdb_enable_source_id_refresh)
       APPEND
       PROPERTY CMAKE_CONFIGURE_DEPENDS ${_VANE_DUCKDB_SOURCE_DEPENDENCIES})
 
-    # This target intentionally runs on every native build. The script uses a
-    # disposable Git index and rewrites the binary-directory header only when
-    # the DuckDB tree ID changes, so direct incremental builds cannot retain a
-    # SourceID from a previous branch or worktree state.
+    # This target intentionally runs on every native build. The script computes
+    # the identity without writing the source tree and rewrites the generated
+    # header only when the DuckDB tree ID changes, so direct incremental builds
+    # cannot retain an earlier SourceID.
     add_custom_target(
       vane_duckdb_source_id_refresh ALL
       COMMAND "${Python_EXECUTABLE}" "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}"
