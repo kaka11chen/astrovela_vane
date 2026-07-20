@@ -323,6 +323,7 @@ def _init_ray_for_fault_test(monkeypatch) -> None:
         "VANE_FTE_SPLIT_QUEUE_SPACE_WAIT_TIMEOUT_S": os.environ.get("VANE_FTE_SPLIT_QUEUE_SPACE_WAIT_TIMEOUT_S", "0.1"),
     }
     ray.init(
+        address="local",
         ignore_reinit_error=True,
         log_to_driver=True,
         num_cpus=int(os.environ.get("VANE_TEST_RAY_NUM_CPUS", "4")),
