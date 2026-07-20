@@ -168,8 +168,8 @@ function(_duckdb_resolve_source_id)
       "${PROJECT_SOURCE_DIR}/scripts/sync_duckdb_source_id.py")
   set(_VANE_DUCKDB_DEFAULT_SOURCE_PATH "${PROJECT_SOURCE_DIR}/external/duckdb")
 
-  # DuckDB formatting updates this manifest after engine changes. Make direct
-  # incremental builds reconfigure before reusing the embedded SourceID.
+  # Git builds keep an ignored local manifest as a CMake reconfiguration stamp.
+  # Source archives carry the same generated file without requiring Git.
   set_property(
     DIRECTORY "${PROJECT_SOURCE_DIR}"
     APPEND
@@ -186,7 +186,7 @@ function(_duckdb_resolve_source_id)
     endif()
     find_package(Python REQUIRED COMPONENTS Interpreter)
     execute_process(
-      COMMAND "${Python_EXECUTABLE}" "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}" --print
+      COMMAND "${Python_EXECUTABLE}" "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}"
       WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
       RESULT_VARIABLE _VANE_DUCKDB_SOURCE_ID_RESULT
       OUTPUT_VARIABLE _VANE_DUCKDB_SOURCE_ID

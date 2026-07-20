@@ -14,10 +14,10 @@ export SKBUILD_CMAKE_BUILD_TYPE=Release
 uv pip install . --no-build-isolation
 ```
 
-DuckDB and workspace formatting automatically synchronize the content-derived
-`DUCKDB_SOURCE_ID`. The pre-commit hook also repairs it from the staged DuckDB
-tree if formatting was skipped; install that hook once per clone with
-`pre-commit install`. CI rejects an out-of-date value.
+DuckDB and workspace formatting refresh the ignored, content-derived
+`DUCKDB_SOURCE_ID` manifest used as a local build stamp. Do not add that file to
+Git. The PEP 517 backend generates and validates it when building source
+distributions.
 
 ## Formatting
 

@@ -45,18 +45,19 @@ description is passed through `OVERRIDE_GIT_DESCRIBE` in `pyproject.toml` to
 preserve DuckDB's human-readable version line in source archives without Git
 metadata.
 
-The exact engine identity is content-derived instead. `DUCKDB_SOURCE_ID`
-records the full Git tree object for `external/duckdb`, computed with
-`scripts/sync_duckdb_source_id.py`. The top-level CMake build passes that value
-through its first 10 hexadecimal characters as `GIT_COMMIT_HASH` and DuckDB's
-embedded `SourceID`. The tree object depends on engine paths, modes, and
-contents rather than commit topology, so rebases and squash merges do not
-change the SourceID.
-Ordinary engine changes update only `DUCKDB_SOURCE_ID`; changes to the upstream
-baseline, DuckDB version line, or historical mapping must also update this
-document and `OVERRIDE_GIT_DESCRIBE`. Release reviews must record the full tree
-ID and inspect subsequent Vane engine commits since the previously released
-state.
+The exact engine identity is content-derived instead. The build computes the
+full Git tree object for `external/duckdb` with
+`scripts/sync_duckdb_source_id.py`. Git checkouts keep `DUCKDB_SOURCE_ID` as an
+ignored local manifest; the PEP 517 backend generates and embeds that manifest
+in source distributions so builds without Git metadata retain the same
+identity. The top-level CMake build passes its first 10 hexadecimal characters
+as `GIT_COMMIT_HASH` and DuckDB's embedded `SourceID`. The tree object depends
+on engine paths, modes, and contents rather than commit topology, so rebases and
+squash merges do not change the SourceID. Ordinary engine changes require no
+tracked identity update. Changes to the upstream baseline, DuckDB version line,
+or historical mapping must update this document and `OVERRIDE_GIT_DESCRIBE`.
+Release reviews must record the full tree ID and inspect subsequent Vane engine
+commits since the previously released state.
 
 The statically linked DuckDB HTTPFS extension is fetched separately during the
 native build and pinned to commit

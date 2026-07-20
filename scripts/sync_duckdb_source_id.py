@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Synchronize DuckDB's recorded SourceID with its Git tree object."""
+"""Compute and materialize DuckDB's content-derived SourceID."""
 
 from __future__ import annotations
 
@@ -54,75 +54,39 @@ def source_tree_id() -> str:
     return tree_id
 
 
-def staged_source_tree_id() -> str:
-    """Return the DuckDB tree ID represented by the real Git index."""
-    repository_tree = _git("write-tree")
-    tree_id = _git("rev-parse", f"{repository_tree}:{SOURCE_DIRECTORY}")
+def synchronize_source_id() -> str:
+    """Write the ignored SourceID manifest when needed and return its value."""
+    tree_id = source_tree_id()
+    expected = tree_id + "\n"
+    actual = SOURCE_ID_FILE.read_text(encoding="utf-8") if SOURCE_ID_FILE.exists() else ""
 
-    if GIT_OBJECT_ID.fullmatch(tree_id) is None:
-        raise RuntimeError(f"Git returned an invalid DuckDB tree ID: {tree_id!r}")
+    if actual != expected:
+        SOURCE_ID_FILE.write_text(expected, encoding="utf-8")
+
     return tree_id
-
-
-def staged_source_id_inputs_changed() -> bool:
-    """Return whether staged engine or SourceID content differs from HEAD."""
-    result = subprocess.run(
-        (
-            "git",
-            "diff",
-            "--cached",
-            "--quiet",
-            "--no-ext-diff",
-            "HEAD",
-            "--",
-            SOURCE_DIRECTORY,
-            SOURCE_ID_PATH,
-        ),
-        cwd=REPOSITORY_ROOT,
-        check=False,
-    )
-    if result.returncode not in (0, 1):
-        result.check_returncode()
-    return result.returncode == 1
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="fail instead of rewriting an out-of-date SourceID")
-    mode.add_argument("--print", action="store_true", dest="print_only", help="print the current tree ID")
-    mode.add_argument(
-        "--staged-if-changed",
-        action="store_true",
-        help="rewrite from the Git index only when staged engine or SourceID content changed",
-    )
+    mode.add_argument("--print", action="store_true", dest="print_only", help="print without writing the manifest")
     args = parser.parse_args()
 
-    if args.staged_if_changed:
-        if not staged_source_id_inputs_changed():
-            return 0
-        expected = staged_source_tree_id() + "\n"
-    else:
-        expected = source_tree_id() + "\n"
-
     if args.print_only:
-        print(expected, end="")
+        print(source_tree_id())
         return 0
 
-    actual = SOURCE_ID_FILE.read_text(encoding="utf-8") if SOURCE_ID_FILE.exists() else ""
     if args.check:
+        expected = source_tree_id() + "\n"
+        actual = SOURCE_ID_FILE.read_text(encoding="utf-8") if SOURCE_ID_FILE.exists() else ""
         if actual != expected:
             print(f"{SOURCE_ID_FILE} is missing or out of date")
             return 1
         print(f"{SOURCE_ID_FILE} is up to date")
         return 0
 
-    if actual == expected:
-        print(f"{SOURCE_ID_FILE} is up to date")
-        return 0
-
-    SOURCE_ID_FILE.write_text(expected, encoding="utf-8")
-    print(f"wrote {SOURCE_ID_FILE}")
+    print(synchronize_source_id())
     return 0
 
 

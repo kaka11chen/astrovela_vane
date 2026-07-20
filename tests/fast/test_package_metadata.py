@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import subprocess
+import sys
 from importlib.metadata import distribution, metadata, requires, version
 from pathlib import Path
 
@@ -61,7 +63,17 @@ def test_wheel_or_install_contains_primary_and_third_party_license_files():
 
 
 def test_duckdb_source_id_matches_recorded_source_tree():
-    source_tree_id = (REPOSITORY_ROOT / "DUCKDB_SOURCE_ID").read_text(encoding="ascii").strip()
+    if (REPOSITORY_ROOT / ".git").exists():
+        result = subprocess.run(
+            [sys.executable, "scripts/sync_duckdb_source_id.py", "--print"],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        source_tree_id = result.stdout.strip()
+    else:
+        source_tree_id = (REPOSITORY_ROOT / "DUCKDB_SOURCE_ID").read_text(encoding="ascii").strip()
     embedded_source_id = duckdb.sql("SELECT source_id FROM pragma_version()").fetchone()[0]
 
     assert embedded_source_id == source_tree_id[:10]
