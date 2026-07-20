@@ -174,10 +174,11 @@ function(_duckdb_resolve_source_id)
   elseif(NOT DUCKDB_SOURCE_PATH STREQUAL _VANE_DUCKDB_DEFAULT_SOURCE_PATH)
     message(FATAL_ERROR "A custom DUCKDB_SOURCE_PATH requires an explicit "
                         "VANE_DUCKDB_SOURCE_ID.")
-  elseif(EXISTS "${PROJECT_SOURCE_DIR}/.git")
-    if(NOT EXISTS "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}")
-      message(FATAL_ERROR "Missing ${_VANE_DUCKDB_SOURCE_ID_SCRIPT}")
-    endif()
+  elseif(EXISTS "${_VANE_DUCKDB_SOURCE_ID_FILE}"
+         AND NOT EXISTS "${PROJECT_SOURCE_DIR}/.git")
+    file(READ "${_VANE_DUCKDB_SOURCE_ID_FILE}" _VANE_DUCKDB_SOURCE_ID)
+    string(STRIP "${_VANE_DUCKDB_SOURCE_ID}" _VANE_DUCKDB_SOURCE_ID)
+  elseif(EXISTS "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}")
     find_package(Python REQUIRED COMPONENTS Interpreter)
     execute_process(
       COMMAND "${Python_EXECUTABLE}" "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}" --print
@@ -190,15 +191,15 @@ function(_duckdb_resolve_source_id)
       message(FATAL_ERROR "Unable to compute the DuckDB source tree ID: "
                           "${_VANE_DUCKDB_SOURCE_ID_ERROR}")
     endif()
-    set(_VANE_DUCKDB_SOURCE_ID_DYNAMIC TRUE)
-  elseif(EXISTS "${_VANE_DUCKDB_SOURCE_ID_FILE}")
-    file(READ "${_VANE_DUCKDB_SOURCE_ID_FILE}" _VANE_DUCKDB_SOURCE_ID)
-    string(STRIP "${_VANE_DUCKDB_SOURCE_ID}" _VANE_DUCKDB_SOURCE_ID)
+    if(EXISTS "${PROJECT_SOURCE_DIR}/.git")
+      set(_VANE_DUCKDB_SOURCE_ID_DYNAMIC TRUE)
+    endif()
   else()
     message(
       FATAL_ERROR
         "DUCKDB_SOURCE_ID is unavailable. Provide VANE_DUCKDB_SOURCE_ID or "
-        "build from a source tree containing DUCKDB_SOURCE_ID.")
+        "build from a source tree containing DUCKDB_SOURCE_ID or "
+        "scripts/sync_duckdb_source_id.py.")
   endif()
 
   string(LENGTH "${_VANE_DUCKDB_SOURCE_ID}" _VANE_DUCKDB_SOURCE_ID_LENGTH)
@@ -257,6 +258,18 @@ function(_duckdb_enable_source_id_refresh)
   endif()
 
   if(VANE_DUCKDB_SOURCE_ID_DYNAMIC)
+    # Makefile generators check whether CMake must rerun before executing ALL
+    # targets. Watch the external tree itself so configure-time version values
+    # are refreshed on the first incremental build for every generator.
+    file(
+      GLOB_RECURSE _VANE_DUCKDB_SOURCE_DEPENDENCIES
+      LIST_DIRECTORIES FALSE
+      CONFIGURE_DEPENDS "${DUCKDB_SOURCE_PATH}/*")
+    set_property(
+      DIRECTORY "${PROJECT_SOURCE_DIR}"
+      APPEND
+      PROPERTY CMAKE_CONFIGURE_DEPENDS ${_VANE_DUCKDB_SOURCE_DEPENDENCIES})
+
     # This target intentionally runs on every native build. The script uses a
     # disposable Git index and rewrites the binary-directory header only when
     # the DuckDB tree ID changes, so direct incremental builds cannot retain a
@@ -270,10 +283,6 @@ function(_duckdb_enable_source_id_refresh)
       COMMENT "Refreshing DuckDB SourceID"
       VERBATIM)
     add_dependencies(duckdb_func_table_version vane_duckdb_source_id_refresh)
-    set_property(
-      DIRECTORY "${PROJECT_SOURCE_DIR}"
-      APPEND
-      PROPERTY CMAKE_CONFIGURE_DEPENDS "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
   endif()
 
   set_source_files_properties("${_VANE_DUCKDB_SOURCE_ID_HEADER}"

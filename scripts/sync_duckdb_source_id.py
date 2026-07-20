@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -61,11 +63,83 @@ def _write_tree(environment: dict[str, str], temporary_index: Path) -> str:
     return _git("write-tree", env=environment)
 
 
+def _git_top_level() -> Path | None:
+    """Return this checkout's Git root, or None when metadata is unavailable."""
+    try:
+        result = subprocess.run(
+            ("git", "rev-parse", "--show-toplevel"),
+            cwd=REPOSITORY_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return Path(result.stdout.strip()).resolve()
+
+
+def _object_hash(object_type: bytes, contents: bytes) -> bytes:
+    hasher = hashlib.sha1(usedforsecurity=False)
+    hasher.update(object_type + b" " + str(len(contents)).encode("ascii") + b"\0")
+    hasher.update(contents)
+    return hasher.digest()
+
+
+def _file_hash(path: Path, size: int) -> bytes:
+    hasher = hashlib.sha1(usedforsecurity=False)
+    hasher.update(b"blob " + str(size).encode("ascii") + b"\0")
+    bytes_read = 0
+    with path.open("rb") as source_file:
+        while chunk := source_file.read(1024 * 1024):
+            hasher.update(chunk)
+            bytes_read += len(chunk)
+    if bytes_read != size:
+        raise RuntimeError(f"{path} changed while computing the DuckDB source tree ID")
+    return hasher.digest()
+
+
+def _filesystem_tree_hash(directory: Path) -> bytes:
+    entries: list[tuple[bytes, bytes]] = []
+    with os.scandir(directory) as children:
+        for child in children:
+            name = os.fsencode(child.name)
+            path = Path(child.path)
+            metadata = child.stat(follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                mode = b"120000"
+                object_id = _object_hash(b"blob", os.fsencode(os.readlink(child.path)))
+                sort_name = name
+            elif stat.S_ISDIR(metadata.st_mode):
+                mode = b"40000"
+                object_id = _filesystem_tree_hash(path)
+                sort_name = name + b"/"
+            elif stat.S_ISREG(metadata.st_mode):
+                mode = b"100755" if metadata.st_mode & stat.S_IXUSR else b"100644"
+                object_id = _file_hash(path, metadata.st_size)
+                sort_name = name
+            else:
+                raise RuntimeError(f"unsupported file type in DuckDB source tree: {path}")
+            entries.append((sort_name, mode + b" " + name + b"\0" + object_id))
+
+    contents = b"".join(entry for _, entry in sorted(entries))
+    return _object_hash(b"tree", contents)
+
+
+def filesystem_tree_id(source_path: Path | None = None) -> str:
+    """Return a Git-compatible tree ID when repository metadata is absent."""
+    source_path = REPOSITORY_ROOT / SOURCE_DIRECTORY if source_path is None else source_path
+    if not source_path.is_dir():
+        raise RuntimeError(f"DuckDB source directory is unavailable: {source_path}")
+    return _filesystem_tree_hash(source_path).hex()
+
+
 def source_tree_id() -> str:
-    """Return the Git tree ID for the current DuckDB working tree."""
-    top_level = Path(_git("rev-parse", "--show-toplevel")).resolve()
+    """Return the Git-compatible ID for the current DuckDB source tree."""
+    top_level = _git_top_level()
     if top_level != REPOSITORY_ROOT:
-        raise RuntimeError(f"expected Git root {REPOSITORY_ROOT}, found {top_level}")
+        return filesystem_tree_id()
 
     # Use temporary index and object stores so staged, unstaged, and untracked
     # non-ignored DuckDB files all contribute without writing the checkout or

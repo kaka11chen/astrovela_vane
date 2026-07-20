@@ -15,9 +15,11 @@ uv pip install . --no-build-isolation
 ```
 
 Native builds compute the content-derived DuckDB SourceID without modifying the
-checkout. Direct incremental builds refresh a generated header in the build
-directory. The PEP 517 backend injects `DUCKDB_SOURCE_ID` into source
-distributions; do not add that generated file to Git.
+checkout. Direct incremental builds watch the external tree for CMake
+reconfiguration and refresh a generated header in the build directory.
+Git-exported trees derive the same Git-compatible identity from their files
+when no manifest exists. The PEP 517 backend injects `DUCKDB_SOURCE_ID` into
+source distributions; do not add that generated file to Git.
 
 ## Formatting
 

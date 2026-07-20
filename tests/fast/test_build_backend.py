@@ -110,12 +110,24 @@ def test_build_sdist_reuses_manifest_without_git_metadata(tmp_path, monkeypatch)
     assert archive_path.read_bytes() == original_archive
 
 
-def test_build_sdist_requires_manifest_without_git_metadata(tmp_path, monkeypatch):
-    monkeypatch.setattr(build_backend, "REPOSITORY_ROOT", tmp_path)
-    monkeypatch.setattr(build_backend, "SOURCE_ID_FILE", tmp_path / "DUCKDB_SOURCE_ID")
+def test_build_sdist_derives_tree_id_without_git_metadata_or_manifest(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    dist = tmp_path / "dist"
+    filename = "backend-produced.tar.gz"
+    archive_path = dist / filename
+    source_id = "c" * 40
+    _write_sdist(archive_path, {"project-1.0/pyproject.toml": b"[build-system]\n"})
+    _stub_backend(monkeypatch, str(dist), None, filename)
+    monkeypatch.setattr(build_backend, "REPOSITORY_ROOT", source_root)
+    monkeypatch.setattr(build_backend, "SOURCE_ID_FILE", source_root / "DUCKDB_SOURCE_ID")
+    monkeypatch.setattr(build_backend, "source_tree_id", lambda: source_id)
 
-    with pytest.raises(RuntimeError, match="DUCKDB_SOURCE_ID is required"):
-        build_backend.build_sdist(str(tmp_path / "dist"))
+    result = build_backend.build_sdist(str(dist))
+
+    assert result == filename
+    _, contents, _ = _read_sdist_file(archive_path, "/DUCKDB_SOURCE_ID")
+    assert contents == (source_id + "\n").encode("ascii")
 
 
 def test_source_id_injection_replaces_stale_manifest_once(tmp_path):

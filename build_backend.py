@@ -32,9 +32,9 @@ prepare_metadata_for_build_wheel = _backend.prepare_metadata_for_build_wheel
 def _source_id_for_sdist() -> str:
     if (REPOSITORY_ROOT / ".git").exists():
         return source_tree_id()
-    if not SOURCE_ID_FILE.is_file():
-        raise RuntimeError("DUCKDB_SOURCE_ID is required when building an sdist without Git metadata")
-    return validate_source_id(SOURCE_ID_FILE.read_text(encoding="ascii").strip())
+    if SOURCE_ID_FILE.is_file():
+        return validate_source_id(SOURCE_ID_FILE.read_text(encoding="ascii").strip())
+    return source_tree_id()
 
 
 def _gzip_timestamp(path: Path) -> int:
