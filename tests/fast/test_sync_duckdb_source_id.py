@@ -106,3 +106,23 @@ def test_source_tree_id_clears_suppression_in_temporary_index(tmp_path, monkeypa
 
     assert sync_duckdb_source_id.source_tree_id() == expected
     assert _git(tmp_path, "ls-files", "-v", "external/duckdb/source.cpp").startswith(expected_prefix)
+
+
+def test_source_id_header_overrides_engine_and_extension_versions(tmp_path):
+    header = tmp_path / "generated" / "source_id.hpp"
+
+    sync_duckdb_source_id.write_source_id_header(
+        header,
+        "a" * 40,
+        ["EXT_VERSION_PARQUET", "EXT_VERSION_CORE_FUNCTIONS", "DUCKDB_SOURCE_ID"],
+    )
+
+    contents = header.read_text(encoding="ascii")
+    assert contents.count('#define DUCKDB_SOURCE_ID "aaaaaaaaaa"') == 1
+    assert '#define EXT_VERSION_CORE_FUNCTIONS "aaaaaaaaaa"' in contents
+    assert '#define EXT_VERSION_PARQUET "aaaaaaaaaa"' in contents
+
+
+def test_source_id_header_rejects_invalid_preprocessor_definitions(tmp_path):
+    with pytest.raises(ValueError, match="invalid C preprocessor definitions"):
+        sync_duckdb_source_id.write_source_id_header(tmp_path / "source_id.hpp", "a" * 40, ["INVALID-NAME"])

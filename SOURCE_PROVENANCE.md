@@ -49,10 +49,14 @@ The exact engine identity is content-derived instead. The build computes the
 full Git tree object for `external/duckdb` with
 `scripts/sync_duckdb_source_id.py`. Git builds write the short identity only to
 a generated header in the CMake binary directory. The external tree is a CMake
-configuration dependency, so direct Ninja and Makefile builds refresh all
-configure-time version metadata before compiling changed engine sources. When
-Git metadata and a source-distribution manifest are absent, the script derives
-the same Git-compatible object encoding from the materialized tree. The constant
+configuration dependency, so direct Ninja and Makefile builds refresh
+configure-time version metadata after timestamp-visible source changes. The
+version object and the default in-tree static extension entry points
+force-include the generated header, keeping their runtime identities consistent
+on the first build even for mode-only changes that leave timestamps untouched.
+When Git metadata and a source-distribution manifest are absent, the script
+derives the same Git-compatible object encoding from the materialized tree. The
+constant
 `.git_archival.txt` export template records whether that encoding uses SHA-1 or
 SHA-256 without introducing a generated identity file that changes in normal
 commits. The PEP 517 backend injects the full `DUCKDB_SOURCE_ID` manifest into

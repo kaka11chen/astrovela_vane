@@ -223,6 +223,25 @@ function(_duckdb_resolve_source_id)
       PARENT_SCOPE)
 endfunction()
 
+function(_duckdb_collect_buildsystem_targets directory output_variable)
+  get_property(
+    _VANE_DUCKDB_DIRECTORY_TARGETS
+    DIRECTORY "${directory}"
+    PROPERTY BUILDSYSTEM_TARGETS)
+  get_property(
+    _VANE_DUCKDB_SUBDIRECTORIES
+    DIRECTORY "${directory}"
+    PROPERTY SUBDIRECTORIES)
+  foreach(_VANE_DUCKDB_SUBDIRECTORY IN LISTS _VANE_DUCKDB_SUBDIRECTORIES)
+    _duckdb_collect_buildsystem_targets("${_VANE_DUCKDB_SUBDIRECTORY}"
+                                        _VANE_DUCKDB_CHILD_TARGETS)
+    list(APPEND _VANE_DUCKDB_DIRECTORY_TARGETS ${_VANE_DUCKDB_CHILD_TARGETS})
+  endforeach()
+  set(${output_variable}
+      "${_VANE_DUCKDB_DIRECTORY_TARGETS}"
+      PARENT_SCOPE)
+endfunction()
+
 function(_duckdb_enable_source_id_refresh)
   set(_VANE_DUCKDB_SOURCE_ID_SCRIPT
       "${PROJECT_SOURCE_DIR}/scripts/sync_duckdb_source_id.py")
@@ -239,6 +258,73 @@ function(_duckdb_enable_source_id_refresh)
   find_package(Python REQUIRED COMPONENTS Interpreter)
   set(_VANE_DUCKDB_SOURCE_ID_ARGUMENTS --header
                                        "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+
+  # DuckDB supplies the configured source hash as the default version of each
+  # in-tree extension. Record those entry-point targets so the generated header
+  # can override their configure-time definitions when a mode-only change is
+  # invisible to build-system timestamp checks.
+  set(_VANE_DUCKDB_EXTENSION_ROOT "${DUCKDB_SOURCE_PATH}/extension")
+  set(_VANE_DUCKDB_IDENTITY_EXTENSION_TARGETS)
+  set(_VANE_DUCKDB_IDENTITY_EXTENSION_SOURCES)
+  _duckdb_collect_buildsystem_targets("${DUCKDB_SOURCE_PATH}"
+                                      _VANE_DUCKDB_EXTENSION_TARGETS)
+  list(SORT _VANE_DUCKDB_EXTENSION_TARGETS)
+  foreach(_VANE_DUCKDB_EXTENSION_TARGET IN LISTS _VANE_DUCKDB_EXTENSION_TARGETS)
+    if(NOT _VANE_DUCKDB_EXTENSION_TARGET MATCHES "^(.+)_extension$")
+      continue()
+    endif()
+    set(_VANE_DUCKDB_EXTENSION_NAME "${CMAKE_MATCH_1}")
+    if(_VANE_DUCKDB_EXTENSION_NAME MATCHES "_loadable$")
+      continue()
+    endif()
+
+    get_target_property(_VANE_DUCKDB_EXTENSION_SOURCE_DIRECTORY
+                        "${_VANE_DUCKDB_EXTENSION_TARGET}" SOURCE_DIR)
+    if(NOT _VANE_DUCKDB_EXTENSION_SOURCE_DIRECTORY)
+      continue()
+    endif()
+    cmake_path(
+      IS_PREFIX _VANE_DUCKDB_EXTENSION_ROOT
+      "${_VANE_DUCKDB_EXTENSION_SOURCE_DIRECTORY}" NORMALIZE
+      _VANE_DUCKDB_IS_IN_TREE_EXTENSION)
+    if(NOT _VANE_DUCKDB_IS_IN_TREE_EXTENSION)
+      continue()
+    endif()
+
+    string(TOUPPER "${_VANE_DUCKDB_EXTENSION_NAME}"
+                   _VANE_DUCKDB_EXTENSION_NAME_UPPERCASE)
+    set(_VANE_DUCKDB_EXTENSION_DEFINITION
+        "EXT_VERSION_${_VANE_DUCKDB_EXTENSION_NAME_UPPERCASE}=\"${GIT_COMMIT_HASH}\""
+    )
+    get_property(
+      _VANE_DUCKDB_EXTENSION_DEFINITIONS
+      DIRECTORY "${_VANE_DUCKDB_EXTENSION_SOURCE_DIRECTORY}"
+      PROPERTY COMPILE_DEFINITIONS)
+    list(FIND _VANE_DUCKDB_EXTENSION_DEFINITIONS
+         "${_VANE_DUCKDB_EXTENSION_DEFINITION}"
+         _VANE_DUCKDB_EXTENSION_DEFINITION_INDEX)
+    if(_VANE_DUCKDB_EXTENSION_DEFINITION_INDEX EQUAL -1)
+      continue()
+    endif()
+
+    set(_VANE_DUCKDB_EXTENSION_ENTRY_SOURCE
+        "${_VANE_DUCKDB_EXTENSION_SOURCE_DIRECTORY}/${_VANE_DUCKDB_EXTENSION_NAME}_extension.cpp"
+    )
+    if(NOT EXISTS "${_VANE_DUCKDB_EXTENSION_ENTRY_SOURCE}")
+      message(
+        FATAL_ERROR
+          "Unable to apply the dynamic SourceID to ${_VANE_DUCKDB_EXTENSION_TARGET}: "
+          "missing ${_VANE_DUCKDB_EXTENSION_ENTRY_SOURCE}")
+    endif()
+
+    list(APPEND _VANE_DUCKDB_SOURCE_ID_ARGUMENTS --define
+         "EXT_VERSION_${_VANE_DUCKDB_EXTENSION_NAME_UPPERCASE}")
+    list(APPEND _VANE_DUCKDB_IDENTITY_EXTENSION_TARGETS
+         "${_VANE_DUCKDB_EXTENSION_TARGET}")
+    list(APPEND _VANE_DUCKDB_IDENTITY_EXTENSION_SOURCES
+         "${_VANE_DUCKDB_EXTENSION_ENTRY_SOURCE}")
+  endforeach()
+
   if(NOT VANE_DUCKDB_SOURCE_ID_DYNAMIC)
     list(APPEND _VANE_DUCKDB_SOURCE_ID_ARGUMENTS --source-id
          "${VANE_DUCKDB_SOURCE_TREE}")
@@ -280,7 +366,6 @@ function(_duckdb_enable_source_id_refresh)
       WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
       COMMENT "Refreshing DuckDB SourceID"
       VERBATIM)
-    add_dependencies(duckdb_func_table_version vane_duckdb_source_id_refresh)
   endif()
 
   set_source_files_properties("${_VANE_DUCKDB_SOURCE_ID_HEADER}"
@@ -293,6 +378,66 @@ function(_duckdb_enable_source_id_refresh)
   else()
     target_compile_options(duckdb_func_table_version
                            PRIVATE -include "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+  endif()
+  if(VANE_DUCKDB_SOURCE_ID_DYNAMIC)
+    add_dependencies(duckdb_func_table_version vane_duckdb_source_id_refresh)
+  endif()
+
+  list(LENGTH _VANE_DUCKDB_IDENTITY_EXTENSION_TARGETS
+       _VANE_DUCKDB_IDENTITY_EXTENSION_COUNT)
+  if(_VANE_DUCKDB_IDENTITY_EXTENSION_COUNT GREATER 0)
+    math(EXPR _VANE_DUCKDB_IDENTITY_EXTENSION_LAST
+         "${_VANE_DUCKDB_IDENTITY_EXTENSION_COUNT} - 1")
+    foreach(_VANE_DUCKDB_IDENTITY_EXTENSION_INDEX
+            RANGE ${_VANE_DUCKDB_IDENTITY_EXTENSION_LAST})
+      list(GET _VANE_DUCKDB_IDENTITY_EXTENSION_TARGETS
+           ${_VANE_DUCKDB_IDENTITY_EXTENSION_INDEX}
+           _VANE_DUCKDB_IDENTITY_EXTENSION_TARGET)
+      list(GET _VANE_DUCKDB_IDENTITY_EXTENSION_SOURCES
+           ${_VANE_DUCKDB_IDENTITY_EXTENSION_INDEX}
+           _VANE_DUCKDB_IDENTITY_EXTENSION_SOURCE)
+      target_sources("${_VANE_DUCKDB_IDENTITY_EXTENSION_TARGET}"
+                     PRIVATE "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+      set_property(
+        SOURCE "${_VANE_DUCKDB_IDENTITY_EXTENSION_SOURCE}" TARGET_DIRECTORY
+               "${_VANE_DUCKDB_IDENTITY_EXTENSION_TARGET}"
+        APPEND
+        PROPERTY OBJECT_DEPENDS "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+      if(MSVC)
+        set_property(
+          SOURCE "${_VANE_DUCKDB_IDENTITY_EXTENSION_SOURCE}" TARGET_DIRECTORY
+                 "${_VANE_DUCKDB_IDENTITY_EXTENSION_TARGET}"
+          APPEND
+          PROPERTY COMPILE_OPTIONS "/FI${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+      else()
+        set_property(
+          SOURCE "${_VANE_DUCKDB_IDENTITY_EXTENSION_SOURCE}" TARGET_DIRECTORY
+                 "${_VANE_DUCKDB_IDENTITY_EXTENSION_TARGET}"
+          APPEND
+          PROPERTY COMPILE_OPTIONS -include "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+      endif()
+      if(VANE_DUCKDB_SOURCE_ID_DYNAMIC)
+        add_dependencies("${_VANE_DUCKDB_IDENTITY_EXTENSION_TARGET}"
+                         vane_duckdb_source_id_refresh)
+      endif()
+
+      # Static and loadable variants share the same entry-point source and
+      # therefore its directory-scoped source properties. Give the loadable
+      # target the matching generated-file dependency when DuckDB created one.
+      string(
+        REGEX
+        REPLACE "_extension$" "_loadable_extension"
+                _VANE_DUCKDB_IDENTITY_LOADABLE_TARGET
+                "${_VANE_DUCKDB_IDENTITY_EXTENSION_TARGET}")
+      if(TARGET "${_VANE_DUCKDB_IDENTITY_LOADABLE_TARGET}")
+        target_sources("${_VANE_DUCKDB_IDENTITY_LOADABLE_TARGET}"
+                       PRIVATE "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+        if(VANE_DUCKDB_SOURCE_ID_DYNAMIC)
+          add_dependencies("${_VANE_DUCKDB_IDENTITY_LOADABLE_TARGET}"
+                           vane_duckdb_source_id_refresh)
+        endif()
+      endif()
+    endforeach()
   endif()
 endfunction()
 

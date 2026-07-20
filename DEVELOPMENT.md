@@ -141,11 +141,14 @@ paths, modes, symlinks, and contents. Git expands the constant
 `.git_archival.txt` template on export so the fallback preserves the
 repository's SHA-1 or SHA-256 object format without a per-change identity file.
 Native configuration registers the external tree as a CMake configuration
-dependency, so Ninja and Makefile builds refresh configure-time metadata on the
-first incremental build. A lightweight build target also refreshes a generated
-header in the CMake binary directory and recompiles DuckDB's version object only
-when the tree ID changes. The local PEP 517 backend injects `DUCKDB_SOURCE_ID`
-directly into the completed sdist, so read-only source trees remain supported.
+dependency, so Ninja and Makefile builds refresh configure-time metadata after
+timestamp-visible source changes. A lightweight build target also refreshes a
+generated header in the CMake binary directory. DuckDB's version object and the
+entry points of its default in-tree static extensions force-include that header,
+so mode-only changes that leave file timestamps untouched still update every
+runtime SourceID on the first incremental build. The local PEP 517 backend
+injects `DUCKDB_SOURCE_ID` directly into the completed sdist, so read-only source
+trees remain supported.
 The sdist carries that manifest for subsequent builds without Git metadata, and
 artifact validation checks it against the checkout. The manifest is ignored
 build metadata and must not be committed, so parallel engine pull requests do
