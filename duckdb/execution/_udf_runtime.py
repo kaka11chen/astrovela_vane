@@ -34,7 +34,6 @@ from duckdb.execution._common import (
 from duckdb.execution.udf_output_schema import empty_output_table_from_payload as _empty_output_table_from_payload
 from duckdb.execution.udf_ray_config import stream_output_enabled as _stream_output_enabled
 from duckdb.func import FunctionNullHandling
-from duckdb.series import Series
 
 # Mirrors DuckDB's STANDARD_VECTOR_SIZE default batch size.
 BATCH_SIZE = 2048
@@ -119,9 +118,6 @@ _RETURN_NULL = int(PythonExceptionHandling.RETURN_NULL)
 
 
 def _coerce_scalar_array(output: Any, expected_rows: int) -> pa.Array:
-    if isinstance(output, Series):
-        output = output.to_arrow()
-
     if isinstance(output, pa.Table):
         table = output
     elif isinstance(output, pa.RecordBatch):
