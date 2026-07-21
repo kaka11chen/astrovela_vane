@@ -27,7 +27,6 @@ add_library(
   duckdb_python.cpp
   importer.cpp
   ai_sql_functions.cpp
-  map.cpp
   path_like.cpp
   pyconnection.cpp
   datasource_function.cpp

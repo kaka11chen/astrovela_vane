@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 from decimal import Decimal
 
 import pytest
@@ -99,7 +105,10 @@ class TestRAPICloseConnRel:
         with pytest.raises(duckdb.ConnectionException, match="Connection has already been closed"):
             rel.list("")
         with pytest.raises(duckdb.ConnectionException, match="Connection has already been closed"):
-            rel.map(lambda df: df["col0"].add(42).to_frame())
+            rel.map(
+                lambda item, value, count: count,
+                return_type=duckdb.sqltypes.INTEGER,
+            )
         with pytest.raises(duckdb.ConnectionException, match="Connection has already been closed"):
             rel.max("")
         with pytest.raises(duckdb.ConnectionException, match="Connection has already been closed"):
