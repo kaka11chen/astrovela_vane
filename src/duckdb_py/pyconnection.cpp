@@ -40,7 +40,6 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb_python/arrow/arrow_array_stream.hpp"
-#include "duckdb_python/map.hpp"
 #include "duckdb_python/pandas/pandas_scan.hpp"
 #include "duckdb_python/python_udf_utils.hpp"
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
@@ -2947,12 +2946,6 @@ static void SetDefaultConfigArguments(ClientContext &context) {
 void InstantiateNewInstance(DuckDB &db) {
 	auto &db_instance = *db.instance;
 	PandasScanFunction scan_fun;
-	MapFunction map_fun;
-
-	TableFunctionSet map_set(map_fun.name);
-	map_set.AddFunction(std::move(map_fun));
-	CreateTableFunctionInfo map_info(std::move(map_set));
-	map_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 
 	TableFunctionSet scan_set(scan_fun.name);
 	scan_set.AddFunction(std::move(scan_fun));
@@ -2962,7 +2955,6 @@ void InstantiateNewInstance(DuckDB &db) {
 	auto &system_catalog = Catalog::GetSystemCatalog(db_instance);
 	auto transaction = CatalogTransaction::GetSystemTransaction(db_instance);
 
-	system_catalog.CreateFunction(transaction, map_info);
 	system_catalog.CreateFunction(transaction, scan_info);
 
 	auto vllm_set = VLLMFunction::GetFunctions();

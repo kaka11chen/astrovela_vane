@@ -12,6 +12,10 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 ### Changed
 
 - Positioned the current project as the Vane Data developer preview.
+- Defined `DuckDBPyRelation.map` exclusively as a row-wise scalar UDF with a
+  required `return_type`; batch transforms use `map_batches` with an explicit
+  output `schema`. The inherited pandas DataFrame-style DuckDB `map` contract
+  is no longer supported.
 - Restricted source distributions to the DuckDB components required by Vane.
 - Imported the official DuckDB baseline as a squashed Git subtree and retained
   Vane engine customizations as monorepo commits, so normal clones no longer
