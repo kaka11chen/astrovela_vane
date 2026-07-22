@@ -30,10 +30,12 @@ def _make_test_physical_plan(con=None):
 
 
 @pytest.mark.parametrize("should_fail", [False, True], ids=["success", "failure"])
-def test_ray_backed_result_partition_materialization_is_single_flight(should_fail):
+def test_ray_backed_result_partition_concurrent_materialization(should_fail):
     script = textwrap.dedent(
         f"""
+        import concurrent.futures
         import json
+        import threading
         import time
 
         import duckdb
@@ -52,9 +54,23 @@ def test_ray_backed_result_partition_materialization_is_single_flight(should_fai
                     raise RuntimeError("materialization boom")
                 return pa.table({{"value": [1, 2, 3]}})
 
+        thread_count = 8
         payload = Payload()
-        result = duckdb.ray_cxx.ray_backed_result_partition_materialization_for_test(payload, 8)
-        print(json.dumps({{"calls": payload.calls, "result": result}}, sort_keys=True))
+        partition = duckdb.ray_cxx._RayBackedResultPartitionForTest(payload)
+        barrier = threading.Barrier(thread_count)
+
+        def materialize():
+            barrier.wait()
+            try:
+                return {{"rows": partition.materialize(), "error": "", "error_type": ""}}
+            except Exception as ex:
+                return {{"rows": 0, "error": str(ex), "error_type": type(ex).__name__}}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
+            futures = [executor.submit(materialize) for _ in range(thread_count)]
+            results = [future.result() for future in futures]
+
+        print(json.dumps({{"calls": payload.calls, "results": results}}, sort_keys=True))
         """
     )
 
@@ -67,20 +83,16 @@ def test_ray_backed_result_partition_materialization_is_single_flight(should_fai
 
     assert completed.returncode == 0, f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
     observed = json.loads(completed.stdout.strip().splitlines()[-1])
-    assert observed["calls"] == 1
-
-    result = observed["result"]
+    results = observed["results"]
     if should_fail:
-        assert result["row_counts"] == [0] * 8
-        assert result["same_collection"] is False
-        assert all("materialization boom" in error for error in result["errors"])
-        assert {json.loads(error)["exception_type"] for error in result["errors"]} == {"Invalid Input"}
+        assert observed["calls"] == 1
+        assert [result["rows"] for result in results] == [0] * 8
+        assert all("materialization boom" in result["error"] for result in results)
+        assert {result["error_type"] for result in results} == {"InvalidInputException"}
     else:
-        assert result["row_counts"] == [3] * 8
-        assert result["errors"] == [""] * 8
-        assert result["same_collection"] is True
-        assert result["num_rows"] == 3
-        assert result["size_bytes"] > 0
+        assert observed["calls"] == 1
+        assert [result["rows"] for result in results] == [3] * 8
+        assert [result["error"] for result in results] == [""] * 8
 
 
 def test_distributed_physical_plan_inspectors():

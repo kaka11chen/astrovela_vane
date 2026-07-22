@@ -4,7 +4,7 @@
 #pragma once
 
 #include <pybind11/pybind11.h>
-#include <condition_variable>
+#include <atomic>
 #include <exception>
 #include <memory>
 #include <vector>
@@ -146,16 +146,12 @@ public:
 	}
 
 private:
-	enum class MaterializationState : uint8_t { UNMATERIALIZED, MATERIALIZING, READY, FAILED };
-
 	duckdb::distributed::python::ray::SafePyObject object_ref_;
 	duckdb::distributed::python::ray::SafePyObject lease_owner_;
 	size_t num_rows_;
 	size_t size_bytes_;
-	mutable std::mutex materialize_mutex_;
-	mutable std::condition_variable materialize_cv_;
-	mutable MaterializationState materialize_state_ = MaterializationState::UNMATERIALIZED;
-	mutable std::shared_ptr<duckdb::ColumnDataCollection> materialized_collection_;
+	mutable std::once_flag materialize_once_;
+	mutable std::atomic<std::shared_ptr<duckdb::ColumnDataCollection>> materialized_collection_;
 	mutable std::exception_ptr materialize_error_;
 };
 

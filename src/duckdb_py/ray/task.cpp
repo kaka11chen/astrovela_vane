@@ -350,13 +350,7 @@ duckdb::distributed::DuckDBResult<size_t> RayBackedResultPartition::size_bytes()
 		return duckdb::distributed::DuckDBResult<size_t>::ok(size_bytes_);
 	}
 
-	std::shared_ptr<duckdb::ColumnDataCollection> collection;
-	{
-		std::lock_guard<std::mutex> guard(materialize_mutex_);
-		if (materialize_state_ == MaterializationState::READY) {
-			collection = materialized_collection_;
-		}
-	}
+	auto collection = materialized_collection_.load();
 	return duckdb::distributed::DuckDBResult<size_t>::ok(collection ? collection->SizeInBytes() : 0);
 }
 
@@ -365,13 +359,7 @@ duckdb::distributed::DuckDBResult<size_t> RayBackedResultPartition::num_rows() c
 		return duckdb::distributed::DuckDBResult<size_t>::ok(num_rows_);
 	}
 
-	std::shared_ptr<duckdb::ColumnDataCollection> collection;
-	{
-		std::lock_guard<std::mutex> guard(materialize_mutex_);
-		if (materialize_state_ == MaterializationState::READY) {
-			collection = materialized_collection_;
-		}
-	}
+	auto collection = materialized_collection_.load();
 	return duckdb::distributed::DuckDBResult<size_t>::ok(collection ? collection->Count() : 0);
 }
 
@@ -384,64 +372,28 @@ py::object RayBackedResultPartition::GetLeaseOwner() const {
 }
 
 std::shared_ptr<duckdb::ColumnDataCollection> RayBackedResultPartition::to_column_data() const {
-	// Python callers enter with the GIL. Release it before waiting on the
-	// single-flight state so the materializing thread can acquire it.
+	// Python callers may enter with the GIL. Release it before call_once waits
+	// so the materializing thread can acquire it.
 	ScopedGILReleaseIfHeld release_gil;
 
-	std::shared_ptr<duckdb::ColumnDataCollection> collection;
-	std::exception_ptr materialize_error;
-	bool materialization_owner = false;
-	{
-		std::unique_lock<std::mutex> guard(materialize_mutex_);
-		materialize_cv_.wait(guard, [this] { return materialize_state_ != MaterializationState::MATERIALIZING; });
-
-		if (materialize_state_ == MaterializationState::READY) {
-			collection = materialized_collection_;
-		} else if (materialize_state_ == MaterializationState::FAILED) {
-			materialize_error = materialize_error_;
-		} else {
-			materialize_state_ = MaterializationState::MATERIALIZING;
-			materialization_owner = true;
-		}
-	}
-
-	if (!materialization_owner) {
-		if (materialize_error) {
-			std::rethrow_exception(materialize_error);
-		}
-		return collection;
-	}
-
-	try {
-		duckdb::PythonGILWrapper gil;
+	std::call_once(materialize_once_, [this] {
 		try {
-			auto object_ref = object_ref_.get();
-			collection = MaterializePyPayloadToCollection(object_ref, nullptr);
-		} catch (const py::error_already_set &ex) {
-			// error_already_set owns Python state, so normalize it while the GIL
-			// is held before publishing a failure to native waiters.
-			throw duckdb::InvalidInputException("Failed to materialize Ray result partition: %s", ex.what());
+			duckdb::PythonGILWrapper gil;
+			try {
+				auto object_ref = object_ref_.get();
+				materialized_collection_.store(MaterializePyPayloadToCollection(object_ref, nullptr));
+			} catch (const py::error_already_set &ex) {
+				throw duckdb::InvalidInputException("Failed to materialize Ray result partition: %s", ex.what());
+			}
+		} catch (...) {
+			materialize_error_ = std::current_exception();
 		}
-	} catch (...) {
-		materialize_error = std::current_exception();
-	}
+	});
 
-	{
-		std::lock_guard<std::mutex> guard(materialize_mutex_);
-		if (materialize_error) {
-			materialize_error_ = materialize_error;
-			materialize_state_ = MaterializationState::FAILED;
-		} else {
-			materialized_collection_ = collection;
-			materialize_state_ = MaterializationState::READY;
-		}
+	if (materialize_error_) {
+		std::rethrow_exception(materialize_error_);
 	}
-	materialize_cv_.notify_all();
-
-	if (materialize_error) {
-		std::rethrow_exception(materialize_error);
-	}
-	return collection;
+	return materialized_collection_.load();
 }
 
 py::object duckdb::distributed::python::ray::ResultPartitionToPyObject(
