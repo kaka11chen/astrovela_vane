@@ -6,13 +6,12 @@
 
 #include "duckdb/main/relation/order_relation.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/config.hpp"
 #include "duckdb/parser/query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/planner/binder.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 
 namespace duckdb {
@@ -25,83 +24,86 @@ OrderRelation::OrderRelation(shared_ptr<Relation> child_p, vector<OrderByNode> o
 }
 
 unique_ptr<QueryNode> OrderRelation::GetQueryNode() {
-	auto select = make_uniq<SelectNode>();
-	select->from_table = child->GetTableRef();
-	select->select_list.push_back(make_uniq<StarExpression>());
+	unique_ptr<QueryNode> result;
+	if (RequiresSQLMultiSourceBinding(*child)) {
+		result = child->GetQueryNode();
+	} else {
+		auto select = make_uniq<SelectNode>();
+		select->from_table = child->GetTableRef();
+		select->select_list.push_back(make_uniq<StarExpression>());
+		result = std::move(select);
+	}
+	D_ASSERT(result->type == QueryNodeType::SELECT_NODE);
+	auto &select = result->Cast<SelectNode>();
 	auto order_node = make_uniq<OrderModifier>();
 	for (idx_t i = 0; i < orders.size(); i++) {
 		order_node->orders.emplace_back(orders[i].type, orders[i].null_order, orders[i].expression->Copy());
 	}
-	select->modifiers.push_back(std::move(order_node));
-	return std::move(select);
+	select.modifiers.push_back(std::move(order_node));
+	return result;
 }
 
 BoundStatement OrderRelation::Bind(Binder &binder) {
-	if (!CanMapColumnBindings(*child)) {
+	if (!RequiresDirectRelationBinding(*child)) {
 		return Relation::Bind(binder);
 	}
-	bool order_by_all = false;
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list.push_back(make_uniq<StarExpression>());
+	auto order_node = make_uniq<OrderModifier>();
 	for (auto &order : orders) {
-		if (order.expression->HasSubquery() || order.expression->IsAggregate() || order.expression->IsWindow()) {
-			return Relation::Bind(binder);
-		}
-		if (order.expression->GetExpressionClass() == ExpressionClass::CONSTANT) {
-			auto &constant = order.expression->Cast<ConstantExpression>();
-			if (!constant.value.type().IsIntegral()) {
-				return Relation::Bind(binder);
-			}
-		}
-		if (order.expression->GetExpressionType() == ExpressionType::STAR) {
-			auto &star = order.expression->Cast<StarExpression>();
-			if (orders.size() != 1 || !star.exclude_list.empty() || !star.replace_list.empty() || star.expr) {
-				return Relation::Bind(binder);
-			}
-			order_by_all = true;
-		}
+		order_node->orders.emplace_back(order.type, order.null_order, order.expression->Copy());
 	}
+	select_node->modifiers.push_back(std::move(order_node));
+	return BindSelectNodeOnChild(binder, *child, std::move(select_node));
+}
 
-	auto child_bound = child->Bind(binder);
-	auto bindings = child_bound.plan->GetColumnBindings();
-	D_ASSERT(bindings.size() == child_bound.names.size());
-	D_ASSERT(bindings.size() == child_bound.types.size());
+BoundStatement OrderRelation::BindAsInput(Binder &binder) {
+	auto child_ref = BindRelationInput(binder, *child);
+	auto child_bound = binder.Bind(*child_ref);
+	vector<unique_ptr<ParsedExpression>> visible_columns;
+	ExpandRelationStar(binder, make_uniq<StarExpression>(), visible_columns);
 
 	auto &config = DBConfig::GetConfig(binder.context);
+	ExpressionBinder expression_binder(binder, binder.context);
 	vector<BoundOrderByNode> bound_orders;
 	for (auto &order : orders) {
 		auto order_type = config.ResolveOrder(binder.context, order.type);
 		auto null_order = config.ResolveNullOrder(binder.context, order_type, order.null_order);
-		if (order_by_all) {
-			for (idx_t column_idx = 0; column_idx < bindings.size(); column_idx++) {
-				unique_ptr<Expression> expression = make_uniq<BoundColumnRefExpression>(
-				    child_bound.names[column_idx], child_bound.types[column_idx], bindings[column_idx]);
-				ExpressionBinder::PushCollation(binder.context, expression, expression->return_type);
-				bound_orders.emplace_back(order_type, null_order, std::move(expression));
+		vector<unique_ptr<ParsedExpression>> order_expressions;
+		ExpandRelationStar(binder, order.expression->Copy(), order_expressions);
+		for (auto &expression : order_expressions) {
+			if (expression->GetExpressionClass() == ExpressionClass::CONSTANT) {
+				auto &constant = expression->Cast<ConstantExpression>();
+				if (constant.value.type().IsIntegral()) {
+					auto position = constant.value.GetValue<int64_t>();
+					if (position <= 0 || static_cast<idx_t>(position) > visible_columns.size()) {
+						throw BinderException("ORDER BY position %lld is not in select list", position);
+					}
+					expression = visible_columns[static_cast<idx_t>(position - 1)]->Copy();
+				}
 			}
-			continue;
-		}
-		if (order.expression->GetExpressionClass() == ExpressionClass::CONSTANT) {
-			auto &constant = order.expression->Cast<ConstantExpression>();
-			auto order_value = constant.value.GetValue<int64_t>();
-			if (order_value <= 0 || NumericCast<idx_t>(order_value) > bindings.size()) {
-				throw BinderException(*order.expression, "ORDER term out of range - should be between 1 and %llu",
-				                      bindings.size());
-			}
-			auto column_idx = NumericCast<idx_t>(order_value - 1);
-			unique_ptr<Expression> expression = make_uniq<BoundColumnRefExpression>(
-			    child_bound.names[column_idx], child_bound.types[column_idx], bindings[column_idx]);
-			ExpressionBinder::PushCollation(binder.context, expression, expression->return_type);
-			bound_orders.emplace_back(order_type, null_order, std::move(expression));
-			continue;
-		}
-		auto expression = BindExpressionOnBoundRelation(binder, *child, child_bound, order.expression->Copy(), "order");
-		ExpressionBinder::PushCollation(binder.context, expression, expression->return_type);
-		bound_orders.emplace_back(order_type, null_order, std::move(expression));
-	}
 
-	auto logical_order = make_uniq<LogicalOrder>(std::move(bound_orders));
-	logical_order->AddChild(std::move(child_bound.plan));
-	child_bound.plan = std::move(logical_order);
+			auto bound_expression = expression_binder.Bind(expression);
+			ExpressionBinder::PushCollation(binder.context, bound_expression, bound_expression->return_type);
+			bound_orders.emplace_back(order_type, null_order, std::move(bound_expression));
+		}
+	}
+	for (auto &order : bound_orders) {
+		PlanRelationSubqueries(binder, order.expression, child_bound.plan);
+	}
+	auto order = make_uniq<LogicalOrder>(std::move(bound_orders));
+	order->AddChild(std::move(child_bound.plan));
+	child_bound.plan = std::move(order);
 	return child_bound;
+}
+
+bool OrderRelation::CanSerializeToQueryNode() {
+	for (auto &order : orders) {
+		if (!CanSerializeExpressionOnChild(*child, *order.expression)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 string OrderRelation::GetAlias() {

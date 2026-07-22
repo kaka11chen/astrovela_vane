@@ -3,14 +3,13 @@
 
 #include "duckdb/main/relation/repartition_relation.hpp"
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/operator/exchange/repartition.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression_binder/relation_binder.hpp"
 #include "duckdb/planner/operator/logical_repartition.hpp"
-
-#include <unordered_map>
 
 namespace duckdb {
 
@@ -23,10 +22,8 @@ RepartitionRelation::RepartitionRelation(shared_ptr<Relation> child_p, idx_t num
 }
 
 unique_ptr<QueryNode> RepartitionRelation::GetQueryNode() {
-	// Repartition is not representable in SQL; fall back to the child query node.
-	// This keeps relation->TableFunction (map_batches) working, at the cost of
-	// dropping repartition in SQL-based paths.
-	return child->GetQueryNode();
+	throw NotImplementedException(
+	    "A repartitioned relation has no SQL query-node representation; converting it would discard the exchange");
 }
 
 string RepartitionRelation::GetQuery() {
@@ -42,46 +39,15 @@ const vector<ColumnDefinition> &RepartitionRelation::Columns() {
 }
 
 BoundStatement RepartitionRelation::Bind(Binder &binder) {
-	auto child_bound = child->Bind(binder);
-	auto bindings = child_bound.plan->GetColumnBindings();
-	D_ASSERT(bindings.size() == child_bound.names.size());
-	D_ASSERT(bindings.size() == child_bound.types.size());
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list.push_back(make_uniq<StarExpression>());
+	return BindSelectNodeOnChild(binder, *this, std::move(select_node));
+}
 
-	std::unordered_map<idx_t, vector<string>> names_by_table;
-	std::unordered_map<idx_t, vector<LogicalType>> types_by_table;
-
-	for (idx_t i = 0; i < bindings.size(); i++) {
-		const auto &binding = bindings[i];
-		auto &names = names_by_table[binding.table_index];
-		auto &types = types_by_table[binding.table_index];
-		if (names.size() <= binding.column_index) {
-			names.resize(binding.column_index + 1);
-			types.resize(binding.column_index + 1);
-		}
-		names[binding.column_index] = child_bound.names[i];
-		types[binding.column_index] = child_bound.types[i];
-	}
-
-	for (auto &entry : names_by_table) {
-		auto &names = entry.second;
-		for (idx_t i = 0; i < names.size(); i++) {
-			if (names[i].empty()) {
-				throw InternalException("Failed to build repartition bindings: missing column at index %llu", i);
-			}
-		}
-	}
-
-	auto expr_binder = Binder::CreateBinder(binder.context, binder.shared_from_this());
-	bool single_binding = names_by_table.size() == 1;
-	for (auto &entry : names_by_table) {
-		auto table_index = entry.first;
-		auto &names = entry.second;
-		auto &types = types_by_table[table_index];
-		string alias = single_binding ? child->GetAlias() : StringUtil::Format("__repartition_%llu", table_index);
-		expr_binder->bind_context.AddGenericBinding(table_index, alias, names, types);
-	}
-
-	RelationBinder relation_binder(*expr_binder, binder.context, "repartition");
+BoundStatement RepartitionRelation::BindAsInput(Binder &binder) {
+	auto child_ref = BindRelationInput(binder, *child);
+	auto child_bound = binder.Bind(*child_ref);
+	RelationBinder relation_binder(binder, binder.context, "repartition");
 	vector<ExprRef> partition_exprs;
 	partition_exprs.reserve(partition_by.size());
 	vector<unique_ptr<Expression>> bound_partition_exprs;

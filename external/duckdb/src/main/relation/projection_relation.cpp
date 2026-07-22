@@ -6,6 +6,7 @@
 
 #include "duckdb/main/relation/projection_relation.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/common/exception/parser_exception.hpp"
@@ -30,16 +31,12 @@ ProjectionRelation::ProjectionRelation(shared_ptr<Relation> child_p,
 }
 
 unique_ptr<QueryNode> ProjectionRelation::GetQueryNode() {
-	auto child_ptr = child.get();
-	while (child_ptr->InheritsColumnBindings()) {
-		child_ptr = child_ptr->ChildRelation();
-	}
 	unique_ptr<QueryNode> result;
-	if (child_ptr->type == RelationType::JOIN_RELATION) {
-		// child node is a join: push projection into the child query node
+	if (RequiresSQLMultiSourceBinding(*child)) {
+		// The child has multiple source bindings: push projection into its query node.
 		result = child->GetQueryNode();
 	} else {
-		// child node is not a join: create a new select node and push the child as a table reference
+		// The child has one source binding: create a new select node around its table reference.
 		auto select = make_uniq<SelectNode>();
 		select->from_table = child->GetTableRef();
 		result = std::move(select);
@@ -55,17 +52,25 @@ unique_ptr<QueryNode> ProjectionRelation::GetQueryNode() {
 }
 
 BoundStatement ProjectionRelation::Bind(Binder &binder) {
-	if (!CanMapColumnBindings(*child)) {
+	if (!RequiresDirectRelationBinding(*child)) {
 		return Relation::Bind(binder);
 	}
-	auto child_bound = child->Bind(binder);
 	auto select_node = make_uniq<SelectNode>();
 	select_node->aggregate_handling = AggregateHandling::NO_AGGREGATES_ALLOWED;
 	select_node->select_list.reserve(expressions.size());
 	for (auto &expr : expressions) {
 		select_node->select_list.push_back(expr->Copy());
 	}
-	return BindSelectNodeOnChild(binder, *child, std::move(child_bound), std::move(select_node));
+	return BindSelectNodeOnChild(binder, *child, std::move(select_node));
+}
+
+bool ProjectionRelation::CanSerializeToQueryNode() {
+	for (auto &expression : expressions) {
+		if (!CanSerializeExpressionOnChild(*child, *expression)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 string ProjectionRelation::GetAlias() {

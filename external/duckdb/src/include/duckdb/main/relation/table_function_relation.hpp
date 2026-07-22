@@ -48,6 +48,12 @@ public:
 	void AddNamedParameter(const string &name, Value argument);
 	void RemoveNamedParameterIfExists(const string &name);
 	void SetNamedParameters(named_parameter_map_t &&named_parameters);
+	bool ContainsNonSQLRelation() override {
+		return input_relation && input_relation->ContainsNonSQLRelation();
+	}
+	bool CanSerializeToQueryNode() override {
+		return !input_relation || input_relation->CanSerializeToQueryNode();
+	}
 
 private:
 	void InitializeColumns();

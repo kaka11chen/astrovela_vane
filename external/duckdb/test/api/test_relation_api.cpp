@@ -941,6 +941,25 @@ TEST_CASE("Test table function relations", "[relation_api]") {
 	REQUIRE_THROWS(con.TableFunction("blabla"));
 }
 
+TEST_CASE("Test non-SQL exchanges with table in-out functions", "[relation_api][exchange]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	auto values = con.Values("(42)", {"i"});
+	REQUIRE_NOTHROW(result =
+	                    values->Repartition(2, duckdb::vector<string> {})->TableFunction("summary", {})->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {"[42]"}));
+	REQUIRE_NOTHROW(result = values->LocalExchange(2)->TableFunction("summary", {})->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {"[42]"}));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE MACRO relation_macro(x) AS TABLE SELECT x AS i"));
+	REQUIRE_THROWS_WITH(values->Repartition(2, duckdb::vector<string> {})->TableFunction("relation_macro", {}),
+	                    Catch::Matchers::Contains("would discard"));
+	REQUIRE_THROWS_WITH(values->LocalExchange(2)->TableFunction("relation_macro", {}),
+	                    Catch::Matchers::Contains("would discard"));
+}
+
 TEST_CASE("Test CSV Relation with union by name", "[relation_api]") {
 	DuckDB db(nullptr);
 	Connection con(db);

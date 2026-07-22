@@ -11,7 +11,7 @@
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/planner/binder.hpp"
-#include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/expression_binder/where_binder.hpp"
 
 namespace duckdb {
 
@@ -24,12 +24,8 @@ FilterRelation::FilterRelation(shared_ptr<Relation> child_p, unique_ptr<ParsedEx
 }
 
 unique_ptr<QueryNode> FilterRelation::GetQueryNode() {
-	auto child_ptr = child.get();
-	while (child_ptr->InheritsColumnBindings()) {
-		child_ptr = child_ptr->ChildRelation();
-	}
-	if (child_ptr->type == RelationType::JOIN_RELATION) {
-		// child node is a join: push filter into WHERE clause of select node
+	if (RequiresSQLMultiSourceBinding(*child)) {
+		// The child has multiple source bindings: push the filter into its WHERE clause.
 		auto child_node = child->GetQueryNode();
 		D_ASSERT(child_node->type == QueryNodeType::SELECT_NODE);
 		auto &select_node = child_node->Cast<SelectNode>();
@@ -50,15 +46,28 @@ unique_ptr<QueryNode> FilterRelation::GetQueryNode() {
 }
 
 BoundStatement FilterRelation::Bind(Binder &binder) {
-	if (!CanMapColumnBindings(*child)) {
+	if (!RequiresDirectRelationBinding(*child)) {
 		return Relation::Bind(binder);
 	}
-	auto child_bound = child->Bind(binder);
-	auto bound_condition = BindExpressionOnBoundRelation(binder, *child, child_bound, condition->Copy(), "filter");
-	auto filter = make_uniq<LogicalFilter>(std::move(bound_condition));
-	filter->AddChild(std::move(child_bound.plan));
-	child_bound.plan = std::move(filter);
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list.push_back(make_uniq<StarExpression>());
+	select_node->where_clause = condition->Copy();
+	return BindSelectNodeOnChild(binder, *child, std::move(select_node));
+}
+
+BoundStatement FilterRelation::BindAsInput(Binder &binder) {
+	auto child_ref = BindRelationInput(binder, *child);
+	auto child_bound = binder.Bind(*child_ref);
+	auto condition_copy = condition->Copy();
+	ExpandRelationFilter(binder, condition_copy);
+	WhereBinder where_binder(binder, binder.context);
+	auto bound_condition = where_binder.Bind(condition_copy);
+	child_bound.plan = PlanRelationFilter(binder, std::move(bound_condition), std::move(child_bound.plan));
 	return child_bound;
+}
+
+bool FilterRelation::CanSerializeToQueryNode() {
+	return CanSerializeExpressionOnChild(*child, *condition);
 }
 
 string FilterRelation::GetAlias() {

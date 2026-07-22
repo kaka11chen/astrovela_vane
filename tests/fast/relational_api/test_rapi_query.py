@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import platform
 import sys
 
@@ -26,6 +32,26 @@ def scoped_default(duckdb_cursor):
 
 
 class TestRAPIQuery:
+    @pytest.mark.parametrize(
+        ("operation", "expected"),
+        [
+            ("project", [(1,), (2,)]),
+            ("filter", [(2,)]),
+            ("order", [(2,), (1,)]),
+        ],
+    )
+    def test_explicit_alias_is_binding_boundary_after_filter(self, duckdb_cursor, operation, expected):
+        relation = duckdb_cursor.sql("SELECT * FROM (VALUES (2), (1), (-1)) data(id)").filter("id > 0").set_alias("foo")
+
+        if operation == "project":
+            result = relation.project("foo.id").order("foo.id")
+        elif operation == "filter":
+            result = relation.filter("foo.id > 1")
+        else:
+            result = relation.order("foo.id DESC")
+
+        assert result.fetchall() == expected
+
     @pytest.mark.parametrize("steps", [1, 2, 3, 4])
     def test_query_chain(self, steps):
         con = duckdb.default_connection()

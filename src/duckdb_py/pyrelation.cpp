@@ -456,6 +456,10 @@ string DuckDBPyRelation::ToSQL() {
 		// This relation is just a wrapper around a result set, can't figure out what the SQL was
 		return "";
 	}
+	if (!rel->CanSerializeToQueryNode()) {
+		// Some logical operators and binding scopes have no faithful SQL representation.
+		return "";
+	}
 	try {
 		return rel->GetQueryNode()->ToString();
 	} catch (const std::exception &) {

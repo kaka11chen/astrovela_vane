@@ -1401,7 +1401,7 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 		// run the ToString method of any relation we run, mostly to ensure it doesn't crash
 		relation->ToString();
 		relation->GetAlias();
-		if (relation->IsReadOnly()) {
+		if (relation->IsReadOnly() && relation->CanSerializeToQueryNode()) {
 			// verify read only statements by running a select statement
 			auto select = make_uniq<SelectStatement>();
 			select->node = relation->GetQueryNode();

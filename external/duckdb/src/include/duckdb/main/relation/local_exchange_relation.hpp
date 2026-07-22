@@ -30,6 +30,12 @@ public:
 	Relation *ChildRelation() override {
 		return child.get();
 	}
+	bool ContainsNonSQLRelation() override {
+		return true;
+	}
+
+protected:
+	BoundStatement BindAsInput(Binder &binder) override;
 };
 
 } // namespace duckdb

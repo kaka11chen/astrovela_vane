@@ -1,6 +1,12 @@
 from collections import Counter
 from itertools import product
 
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
 import duckdb
@@ -120,6 +126,13 @@ class TestRAPIJoins:
 
         assert relation.order("1").limit(1).fetchone() == (1, "a")
 
+    def test_order_by_ordinal_uses_visible_columns_after_using_join(self, con):
+        left = con.sql("SELECT * FROM (VALUES (1, 'L1'), (2, 'L2')) data(id, value)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1, 'z'), (2, 'a')) data(id, sort_key)").set_alias("r")
+        relation = left.join(right, "id")
+
+        assert relation.order("3").limit(1).project("*").fetchall() == [(2, "L2", "a")]
+
     def test_filter_columns_expression(self, con):
         relation = con.sql("SELECT * FROM (VALUES (1, 2), (1, -1)) data(a, b)")
 
@@ -160,6 +173,121 @@ class TestRAPIJoins:
         result = relation.project("emp1.emp_id, emp2.emp_id AS manager_id")
 
         assert sorted(result.fetchall()) == sorted(expected)
+
+    @pytest.mark.parametrize(
+        ("operation", "expected"),
+        [
+            ("project", [(1, 10), (1, 20), (2, 10), (2, 20)]),
+            ("filter", [(2, 10), (2, 20)]),
+            ("order", [(2, 20), (2, 10), (1, 20), (1, 10)]),
+            ("aggregate", [(1, 30), (2, 30)]),
+        ],
+    )
+    def test_cross_join_qualified_bindings_survive_unary_operations(self, con, operation, expected):
+        left = con.sql("SELECT * FROM (VALUES (1), (2)) AS data(i)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (10), (20)) AS data(i)").set_alias("r")
+        relation = left.cross(right)
+
+        if operation == "project":
+            result = relation.project("l.i AS left_i, r.i AS right_i")
+        elif operation == "filter":
+            result = relation.filter("l.i = 2")
+        elif operation == "order":
+            result = relation.order("l.i DESC, r.i DESC")
+        else:
+            result = relation.aggregate("l.i AS left_i, sum(r.i) AS total", "l.i")
+
+        rows = result.fetchall()
+        if operation == "order":
+            assert rows == expected
+        else:
+            assert sorted(rows) == expected
+
+    @pytest.mark.parametrize(
+        ("operation", "expected"),
+        [
+            ("project", [(2, 10), (2, 20)]),
+            ("filter", [(2, 20)]),
+            ("order", [(2, 20), (2, 10)]),
+            ("aggregate", [(2, 30)]),
+        ],
+    )
+    def test_cross_join_qualified_bindings_survive_inheriting_filter(self, con, operation, expected):
+        left = con.sql("SELECT * FROM (VALUES (1), (2)) AS data(i)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (10), (20)) AS data(i)").set_alias("r")
+        filtered = left.cross(right).filter("l.i = 2")
+
+        if operation == "project":
+            result = filtered.project("l.i AS left_i, r.i AS right_i")
+        elif operation == "filter":
+            result = filtered.filter("r.i = 20")
+        elif operation == "order":
+            result = filtered.order("r.i DESC")
+        else:
+            result = filtered.aggregate("l.i AS left_i, sum(r.i) AS total", "l.i")
+
+        rows = result.fetchall()
+        if operation == "order":
+            assert rows == expected
+        else:
+            assert sorted(rows) == expected
+
+    def test_cross_join_limit_remains_before_aggregate(self, con):
+        left = con.sql("SELECT 1 AS a FROM range(3)").set_alias("l")
+        right = con.sql("SELECT 10 AS b").set_alias("r")
+
+        result = left.cross(right).limit(1).aggregate("sum(a)")
+
+        assert result.fetchall() == [(1,)]
+
+    @pytest.mark.parametrize("boundary", ["distinct", "limit", "order"])
+    def test_direct_bound_relation_does_not_emit_unbindable_sql(self, con, boundary):
+        left = con.sql("SELECT * FROM (VALUES (1, 10)) data(id, left_value)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1, 20)) data(id, right_value)").set_alias("r")
+        relation = left.join(right, "l.id = r.id")
+        if boundary == "distinct":
+            relation = relation.distinct()
+        elif boundary == "limit":
+            relation = relation.limit(1)
+        else:
+            relation = relation.order("r.right_value")
+        relation = relation.project("r.right_value")
+
+        assert relation.fetchall() == [(20,)]
+        assert relation.sql_query() == ""
+
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM relation")
+
+    def test_explicit_alias_restores_serializable_scope_after_join_boundary(self, con):
+        left = con.sql("SELECT * FROM (VALUES (1, 10)) data(id, left_value)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1, 20)) data(id, right_value)").set_alias("r")
+        relation = left.join(right, "l.id = r.id").distinct().set_alias("joined").project("joined.right_value")
+
+        sql = relation.sql_query()
+        assert sql
+        assert con.sql(sql).fetchall() == relation.fetchall() == [(20,)]
+
+    def test_unqualified_projection_after_join_boundary_remains_serializable(self, con):
+        left = con.sql("SELECT * FROM (VALUES (1, 10)) data(id, left_value)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1, 20)) data(id, right_value)").set_alias("r")
+        relation = left.join(right, "l.id = r.id").distinct().project("right_value")
+
+        sql = relation.sql_query()
+        assert sql
+        assert con.sql(sql).fetchall() == relation.fetchall() == [(20,)]
+
+    @pytest.mark.parametrize("operation", ["create", "create_view", "insert_into"])
+    def test_direct_bound_relation_rejects_sql_terminal_operations(self, con, operation):
+        left = con.sql("SELECT * FROM (VALUES (1, 10)) data(id, left_value)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1, 20)) data(id, right_value)").set_alias("r")
+        relation = left.join(right, "l.id = r.id").distinct().project("r.right_value")
+        target = f"direct_bound_{operation}"
+        if operation == "insert_into":
+            con.execute(f"CREATE TABLE {target} (right_value INTEGER)")
+
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            getattr(relation, operation)(target)
 
     @pytest.mark.parametrize("threads", [1, 4])
     @pytest.mark.parametrize("left_count,right_count", CROSS_JOIN_BOUNDARY_CASES)

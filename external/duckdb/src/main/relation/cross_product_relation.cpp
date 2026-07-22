@@ -1,8 +1,15 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation/cross_product_relation.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
@@ -21,6 +28,14 @@ unique_ptr<QueryNode> CrossProductRelation::GetQueryNode() {
 	result->select_list.push_back(make_uniq<StarExpression>());
 	result->from_table = GetTableRef();
 	return std::move(result);
+}
+
+BoundStatement CrossProductRelation::BindAsInput(Binder &binder) {
+	if (ContainsNonSQLRelation()) {
+		return Relation::Bind(binder);
+	}
+	auto table_ref = GetTableRef();
+	return binder.Bind(*table_ref);
 }
 
 unique_ptr<TableRef> CrossProductRelation::GetTableRef() {

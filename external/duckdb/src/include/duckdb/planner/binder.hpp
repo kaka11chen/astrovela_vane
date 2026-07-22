@@ -202,8 +202,8 @@ struct QueryBinderState {
 */
 class Binder : public enable_shared_from_this<Binder> {
 	friend class ExpressionBinder;
-	friend class RecursiveDependentJoinPlanner;
 	friend class Relation;
+	friend class RecursiveDependentJoinPlanner;
 
 public:
 	DUCKDB_API static shared_ptr<Binder> CreateBinder(ClientContext &context, optional_ptr<Binder> parent = nullptr,

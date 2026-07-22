@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation/create_view_relation.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
@@ -21,6 +27,11 @@ CreateViewRelation::CreateViewRelation(shared_ptr<Relation> child_p, string sche
 }
 
 BoundStatement CreateViewRelation::Bind(Binder &binder) {
+	if (!child->CanSerializeToQueryNode()) {
+		throw NotImplementedException(
+		    "Cannot create a view from a relation that cannot be faithfully represented as a "
+		    "SQL query node; conversion would discard the exchange or lose relation bindings");
+	}
 	auto select = make_uniq<SelectStatement>();
 	select->node = child->GetQueryNode();
 

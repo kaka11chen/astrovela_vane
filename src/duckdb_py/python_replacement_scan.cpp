@@ -143,6 +143,11 @@ unique_ptr<TableRef> PythonReplacementScan::TryReplacementObject(const py::objec
 			    "created by another Connection and can therefore not be used by this Connection.",
 			    name);
 		}
+		if (!pyrel->GetRel().CanSerializeToQueryNode()) {
+			throw NotImplementedException("Cannot use a relation that cannot be faithfully represented as a SQL query "
+			                              "node in a replacement scan; conversion would discard the exchange or lose "
+			                              "relation bindings");
+		}
 		// create a subquery from the underlying relation object
 		auto select = make_uniq<SelectStatement>();
 		select->node = pyrel->GetRel().GetQueryNode();

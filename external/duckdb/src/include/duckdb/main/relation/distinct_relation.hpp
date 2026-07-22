@@ -39,6 +39,9 @@ public:
 	Relation *ChildRelation() override {
 		return child.get();
 	}
+
+protected:
+	BoundStatement BindAsInput(Binder &binder) override;
 };
 
 } // namespace duckdb

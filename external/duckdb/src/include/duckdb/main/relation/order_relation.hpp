@@ -43,6 +43,10 @@ public:
 	Relation *ChildRelation() override {
 		return child.get();
 	}
+	bool CanSerializeToQueryNode() override;
+
+protected:
+	BoundStatement BindAsInput(Binder &binder) override;
 };
 
 } // namespace duckdb

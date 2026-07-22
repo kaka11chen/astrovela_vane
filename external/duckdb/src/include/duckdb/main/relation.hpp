@@ -234,20 +234,39 @@ public:
 	virtual Relation *ChildRelation() {
 		return nullptr;
 	}
+	virtual bool ContainsNonSQLRelation() {
+		auto child = ChildRelation();
+		return child && child->ContainsNonSQLRelation();
+	}
+	//! Whether GetQueryNode can represent this relation without losing operators or binding scopes.
+	virtual bool CanSerializeToQueryNode() {
+		if (ContainsNonSQLRelation()) {
+			return false;
+		}
+		auto child = ChildRelation();
+		return !child || child->CanSerializeToQueryNode();
+	}
 	void AddExternalDependency(shared_ptr<ExternalDependency> dependency);
 	DUCKDB_API vector<shared_ptr<ExternalDependency>> GetAllDependencies();
 
 protected:
+	//! Bind this relation for use as another relation's input. Binding-preserving
+	//! relations override this to keep their child's BindContext aligned with the plan.
+	virtual BoundStatement BindAsInput(Binder &binder);
 	DUCKDB_API static string RenderWhitespace(idx_t depth);
-	DUCKDB_API static bool CanMapColumnBindings(Relation &relation);
-	DUCKDB_API static shared_ptr<Binder> CreateBinderForBoundRelation(Binder &binder, Relation &relation,
-	                                                                  const BoundStatement &bound_relation);
-	DUCKDB_API static unique_ptr<Expression> BindExpressionOnBoundRelation(Binder &binder, Relation &relation,
-	                                                                       BoundStatement &bound_relation,
-	                                                                       unique_ptr<ParsedExpression> expression,
-	                                                                       const string &operation);
-	DUCKDB_API static BoundStatement BindSelectNodeOnChild(Binder &binder, Relation &child, BoundStatement child_bound,
+	DUCKDB_API static bool RequiresDirectRelationBinding(Relation &child);
+	DUCKDB_API static bool RequiresSQLMultiSourceBinding(Relation &child);
+	DUCKDB_API static bool CanSerializeExpressionOnChild(Relation &child, const ParsedExpression &expression);
+	DUCKDB_API static unique_ptr<TableRef> BindRelationInput(Binder &binder, Relation &child);
+	DUCKDB_API static BoundStatement BindSelectNodeOnChild(Binder &binder, Relation &child,
 	                                                       unique_ptr<SelectNode> select_node);
+	DUCKDB_API static unique_ptr<LogicalOperator> PlanRelationFilter(Binder &binder, unique_ptr<Expression> condition,
+	                                                                 unique_ptr<LogicalOperator> child);
+	DUCKDB_API static void ExpandRelationFilter(Binder &binder, unique_ptr<ParsedExpression> &condition);
+	DUCKDB_API static void ExpandRelationStar(Binder &binder, unique_ptr<ParsedExpression> expression,
+	                                          vector<unique_ptr<ParsedExpression>> &result);
+	DUCKDB_API static void PlanRelationSubqueries(Binder &binder, unique_ptr<Expression> &expression,
+	                                              unique_ptr<LogicalOperator> &root);
 
 public:
 	template <class TARGET>

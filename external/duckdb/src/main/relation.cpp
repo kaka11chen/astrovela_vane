@@ -28,15 +28,14 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/binder.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
-#include "duckdb/planner/expression_binder/relation_binder.hpp"
-#include "duckdb/planner/expression_binder/where_binder.hpp"
-#include "duckdb/planner/table_binding.hpp"
+#include "duckdb/parser/tableref/bound_ref_wrapper.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/main/relation/join_relation.hpp"
 #include "duckdb/main/relation/value_relation.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
@@ -249,6 +248,11 @@ string Relation::GetAlias() {
 }
 
 unique_ptr<TableRef> Relation::GetTableRef() {
+	if (!CanSerializeToQueryNode()) {
+		throw NotImplementedException("Cannot create a table reference for a relation that cannot be faithfully "
+		                              "represented as a SQL query node; conversion would discard the exchange or lose "
+		                              "relation bindings");
+	}
 	auto select = make_uniq<SelectStatement>();
 	select->node = GetQueryNode();
 	return make_uniq<SubqueryRef>(std::move(select), GetAlias());
@@ -268,239 +272,122 @@ unique_ptr<QueryResult> Relation::ExecuteOrThrow() {
 }
 
 BoundStatement Relation::Bind(Binder &binder) {
+	if (!CanSerializeToQueryNode()) {
+		throw NotImplementedException(
+		    "Cannot bind a relation that cannot be faithfully represented as a SQL query node; "
+		    "conversion would discard the exchange or lose relation bindings");
+	}
 	SelectStatement stmt;
 	stmt.node = GetQueryNode();
 	return binder.Bind(stmt.Cast<SQLStatement>());
 }
 
-bool Relation::CanMapColumnBindings(Relation &relation) {
-	if (relation.InheritsColumnBindings()) {
-		auto child = relation.ChildRelation();
-		if (child) {
-			return CanMapColumnBindings(*child);
-		}
-	}
-	switch (relation.type) {
-	case RelationType::JOIN_RELATION: {
-		auto &join = relation.Cast<JoinRelation>();
-		if (!join.using_columns.empty() || !join.condition || join.join_ref_type != JoinRefType::REGULAR ||
-		    join.join_type != JoinType::INNER) {
-			return false;
-		}
-		return CanMapColumnBindings(*join.left) && CanMapColumnBindings(*join.right);
-	}
-	case RelationType::CROSS_PRODUCT_RELATION: {
-		auto &cross = relation.Cast<CrossProductRelation>();
-		return CanMapColumnBindings(*cross.left) && CanMapColumnBindings(*cross.right);
-	}
-	default:
+BoundStatement Relation::BindAsInput(Binder &binder) {
+	return Bind(binder);
+}
+
+bool Relation::RequiresDirectRelationBinding(Relation &child) {
+	if (child.ContainsNonSQLRelation()) {
 		return true;
 	}
+	auto child_ptr = &child;
+	while (child_ptr->InheritsColumnBindings()) {
+		child_ptr = child_ptr->ChildRelation();
+		D_ASSERT(child_ptr);
+	}
+	return child_ptr->type == RelationType::JOIN_RELATION || child_ptr->type == RelationType::CROSS_PRODUCT_RELATION;
 }
 
-struct RelationBindingGroup {
-	string alias;
-	idx_t column_count;
-};
-
-static void CollectBindingGroups(Relation &relation, vector<RelationBindingGroup> &groups) {
-	if (relation.InheritsColumnBindings()) {
-		auto child = relation.ChildRelation();
-		if (child) {
-			CollectBindingGroups(*child, groups);
-			return;
-		}
+bool Relation::RequiresSQLMultiSourceBinding(Relation &child) {
+	auto child_ptr = &child;
+	// Filters can be merged into the same SELECT without changing relational
+	// ordering. Other inheriting relations (LIMIT, DISTINCT, ORDER, etc.) are
+	// semantic boundaries and must remain separate plan nodes.
+	while (child_ptr->type == RelationType::FILTER_RELATION) {
+		child_ptr = child_ptr->ChildRelation();
 	}
-	switch (relation.type) {
-	case RelationType::JOIN_RELATION: {
-		auto &join = relation.Cast<JoinRelation>();
-		if (join.join_type == JoinType::SEMI || join.join_type == JoinType::ANTI) {
-			CollectBindingGroups(*join.left, groups);
-			return;
-		}
-		if (join.join_type == JoinType::RIGHT_SEMI || join.join_type == JoinType::RIGHT_ANTI) {
-			CollectBindingGroups(*join.right, groups);
-			return;
-		}
-		CollectBindingGroups(*join.left, groups);
-		CollectBindingGroups(*join.right, groups);
-		return;
-	}
-	case RelationType::CROSS_PRODUCT_RELATION: {
-		auto &cross = relation.Cast<CrossProductRelation>();
-		CollectBindingGroups(*cross.left, groups);
-		CollectBindingGroups(*cross.right, groups);
-		return;
-	}
-	default:
-		groups.push_back({relation.GetAlias(), relation.Columns().size()});
-		return;
-	}
+	return child_ptr->type == RelationType::JOIN_RELATION || child_ptr->type == RelationType::CROSS_PRODUCT_RELATION;
 }
 
-class MappedRelationBinding : public Binding {
-public:
-	MappedRelationBinding(string alias, vector<string> names, vector<LogicalType> types,
-	                      vector<ColumnBinding> column_bindings_p)
-	    : Binding(BindingType::BASE, BindingAlias(std::move(alias)), std::move(types), std::move(names),
-	              column_bindings_p.empty() ? DConstants::INVALID_INDEX : column_bindings_p[0].table_index),
-	      column_bindings(std::move(column_bindings_p)) {
-		D_ASSERT(column_bindings.size() == this->names.size());
+bool Relation::CanSerializeExpressionOnChild(Relation &child, const ParsedExpression &expression) {
+	if (!child.CanSerializeToQueryNode()) {
+		return false;
+	}
+	if (!RequiresDirectRelationBinding(child) || RequiresSQLMultiSourceBinding(child)) {
+		return true;
 	}
 
-	BindResult Bind(ColumnRefExpression &colref, idx_t depth) override {
-		column_t column_index;
-		if (!TryGetBindingIndex(colref.GetColumnName(), column_index)) {
-			return BindResult(ColumnNotFoundError(colref.GetColumnName()));
+	// A semantic boundary above a join is emitted as a subquery. Only the
+	// subquery alias survives that boundary; qualified references to the join's
+	// original inputs would produce SQL that cannot bind.
+	auto child_alias = child.GetAlias();
+	bool serializable = true;
+	ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(
+	    expression, [&](const ColumnRefExpression &column_ref) {
+		    if (column_ref.IsQualified() && !StringUtil::CIEquals(column_ref.GetTableName(), child_alias)) {
+			    serializable = false;
+		    }
+	    });
+	ParsedExpressionIterator::VisitExpression<StarExpression>(expression, [&](const StarExpression &star) {
+		auto references_other_table = [&](const QualifiedColumnName &column) {
+			return column.IsQualified() && !StringUtil::CIEquals(column.table, child_alias);
+		};
+		if ((!star.relation_name.empty() && !StringUtil::CIEquals(star.relation_name, child_alias)) ||
+		    std::any_of(star.exclude_list.begin(), star.exclude_list.end(), references_other_table) ||
+		    std::any_of(star.rename_list.begin(), star.rename_list.end(),
+		                [&](const auto &entry) { return references_other_table(entry.first); })) {
+			serializable = false;
 		}
-		if (colref.GetAlias().empty()) {
-			colref.SetAlias(names[column_index]);
-		}
-		return BindResult(make_uniq<BoundColumnRefExpression>(colref.GetName(), types[column_index],
-		                                                      column_bindings[column_index], depth));
-	}
+	});
+	return serializable;
+}
 
-private:
-	vector<ColumnBinding> column_bindings;
-};
-
-shared_ptr<Binder> Relation::CreateBinderForBoundRelation(Binder &binder, Relation &relation,
-                                                          const BoundStatement &bound_relation) {
-	auto bindings = bound_relation.plan->GetColumnBindings();
-	D_ASSERT(bindings.size() == bound_relation.names.size());
-	D_ASSERT(bindings.size() == bound_relation.types.size());
-
-	struct BindingColumns {
-		idx_t table_index;
-		vector<string> names;
-		vector<LogicalType> types;
-		vector<ColumnBinding> bindings;
-	};
-	vector<BindingColumns> binding_columns;
-	unordered_map<idx_t, idx_t> binding_positions;
-	for (idx_t column_idx = 0; column_idx < bindings.size(); column_idx++) {
-		const auto &binding = bindings[column_idx];
-		auto entry = binding_positions.find(binding.table_index);
-		if (entry == binding_positions.end()) {
-			binding_positions.emplace(binding.table_index, binding_columns.size());
-			binding_columns.push_back({binding.table_index, {}, {}, {}});
-			entry = binding_positions.find(binding.table_index);
-		}
-		auto &columns = binding_columns[entry->second];
-		if (columns.names.size() <= binding.column_index) {
-			columns.names.resize(binding.column_index + 1);
-			columns.types.resize(binding.column_index + 1);
-			columns.bindings.resize(binding.column_index + 1);
-		}
-		columns.names[binding.column_index] = bound_relation.names[column_idx];
-		columns.types[binding.column_index] = bound_relation.types[column_idx];
-		columns.bindings[binding.column_index] = binding;
-	}
-
-	for (auto &columns : binding_columns) {
-		for (idx_t column_idx = 0; column_idx < columns.names.size(); column_idx++) {
-			if (columns.names[column_idx].empty() ||
-			    columns.bindings[column_idx].table_index == DConstants::INVALID_INDEX) {
-				throw InternalException("Failed to build relation bindings: missing column at index %llu", column_idx);
-			}
-		}
-	}
-
-	vector<RelationBindingGroup> relation_groups;
-	CollectBindingGroups(relation, relation_groups);
-	case_insensitive_map_t<bool> used_aliases;
+unique_ptr<TableRef> Relation::BindRelationInput(Binder &binder, Relation &child) {
+	// BoundRefWrapper lets the normal SELECT binder consume a non-SQL child
+	// without converting its logical plan back into a QueryNode. Keep the
+	// child's full BindContext for binding-preserving relations and joins.
 	auto child_binder = Binder::CreateBinder(binder.context, binder.shared_from_this());
-	auto add_binding = [&](string alias, vector<string> names, vector<LogicalType> types,
-	                       vector<ColumnBinding> bindings) {
-		QueryResult::DeduplicateColumns(names);
-		if (alias.empty() || used_aliases.find(alias) != used_aliases.end()) {
-			alias = StringUtil::Format("__relation_%llu", bindings[0].table_index);
-		}
-		while (used_aliases.find(alias) != used_aliases.end()) {
-			alias += "_";
-		}
-		used_aliases.emplace(alias, true);
-		child_binder->bind_context.AddBinding(make_uniq<MappedRelationBinding>(std::move(alias), std::move(names),
-		                                                                       std::move(types), std::move(bindings)));
-	};
+	auto child_bound = child.BindAsInput(*child_binder);
+	binder.MoveCorrelatedExpressionsFrom(*child_binder);
 
-	bool mapped_relation_groups = relation_groups.size() == binding_columns.size();
-	if (mapped_relation_groups) {
-		for (idx_t group_idx = 0; group_idx < relation_groups.size(); group_idx++) {
-			if (relation_groups[group_idx].column_count != binding_columns[group_idx].names.size()) {
-				mapped_relation_groups = false;
-				break;
-			}
-		}
+	bool multi_source = child.type == RelationType::JOIN_RELATION || child.type == RelationType::CROSS_PRODUCT_RELATION;
+	bool preserves_bindings = child.InheritsColumnBindings() || multi_source;
+	if (!preserves_bindings) {
+		// Projections, aggregates, and explicit aliases establish a new scope.
+		// Rebase that scope on the bound plan's single output table index.
+		auto input_binder = Binder::CreateBinder(binder.context, binder.shared_from_this());
+		auto names = BindContext::AliasColumnNames(child.GetAlias(), child_bound.names, {});
+		input_binder->bind_context.AddGenericBinding(child_bound.plan->GetRootIndex(), child.GetAlias(), names,
+		                                             child_bound.types);
+		child_binder = std::move(input_binder);
 	}
-	if (mapped_relation_groups) {
-		for (idx_t group_idx = 0; group_idx < relation_groups.size(); group_idx++) {
-			auto &columns = binding_columns[group_idx];
-			add_binding(relation_groups[group_idx].alias, std::move(columns.names), std::move(columns.types),
-			            std::move(columns.bindings));
-		}
-		return child_binder;
-	}
-
-	if (binding_columns.size() == 1 && relation_groups.size() > 1) {
-		auto &columns = binding_columns[0];
-		idx_t total_columns = 0;
-		for (auto &group : relation_groups) {
-			total_columns += group.column_count;
-		}
-		if (total_columns == columns.names.size()) {
-			idx_t offset = 0;
-			for (auto &group : relation_groups) {
-				vector<string> names(columns.names.begin() + offset,
-				                     columns.names.begin() + offset + group.column_count);
-				vector<LogicalType> types(columns.types.begin() + offset,
-				                          columns.types.begin() + offset + group.column_count);
-				vector<ColumnBinding> bindings(columns.bindings.begin() + offset,
-				                               columns.bindings.begin() + offset + group.column_count);
-				add_binding(group.alias, std::move(names), std::move(types), std::move(bindings));
-				offset += group.column_count;
-			}
-			return child_binder;
-		}
-	}
-
-	for (auto &columns : binding_columns) {
-		auto alias = binding_columns.size() == 1 ? relation.GetAlias() : string();
-		add_binding(std::move(alias), std::move(columns.names), std::move(columns.types), std::move(columns.bindings));
-	}
-	return child_binder;
+	return make_uniq<BoundRefWrapper>(std::move(child_bound), std::move(child_binder));
 }
 
-unique_ptr<Expression> Relation::BindExpressionOnBoundRelation(Binder &binder, Relation &relation,
-                                                               BoundStatement &bound_relation,
-                                                               unique_ptr<ParsedExpression> expression,
-                                                               const string &operation) {
-	auto child_binder = CreateBinderForBoundRelation(binder, relation, bound_relation);
-	unique_ptr<Expression> bound_expression;
-	if (operation == "filter") {
-		child_binder->BindWhereStarExpression(expression);
-		ExpressionBinder::QualifyColumnNames(*child_binder, expression);
-		WhereBinder where_binder(*child_binder, binder.context);
-		bound_expression = where_binder.Bind(expression);
-	} else {
-		ExpressionBinder::QualifyColumnNames(*child_binder, expression);
-		RelationBinder relation_binder(*child_binder, binder.context, operation);
-		bound_expression = relation_binder.Bind(expression);
-	}
-	if (!bound_expression) {
-		throw InternalException("Failed to bind %s expression", operation);
-	}
-	child_binder->PlanSubqueries(bound_expression, bound_relation.plan);
-	binder.MoveCorrelatedExpressionsFrom(*child_binder);
-	return bound_expression;
+BoundStatement Relation::BindSelectNodeOnChild(Binder &binder, Relation &child, unique_ptr<SelectNode> select_node) {
+	select_node->from_table = BindRelationInput(binder, child);
+	SelectStatement stmt;
+	stmt.node = std::move(select_node);
+	return binder.Bind(stmt.Cast<SQLStatement>());
 }
 
-BoundStatement Relation::BindSelectNodeOnChild(Binder &binder, Relation &child, BoundStatement child_bound,
-                                               unique_ptr<SelectNode> select_node) {
-	auto child_binder = CreateBinderForBoundRelation(binder, child, child_bound);
-	auto result = child_binder->BindSelectNode(*select_node, std::move(child_bound));
-	binder.MoveCorrelatedExpressionsFrom(*child_binder);
-	return result;
+unique_ptr<LogicalOperator> Relation::PlanRelationFilter(Binder &binder, unique_ptr<Expression> condition,
+                                                         unique_ptr<LogicalOperator> child) {
+	return binder.PlanFilter(std::move(condition), std::move(child));
+}
+
+void Relation::ExpandRelationFilter(Binder &binder, unique_ptr<ParsedExpression> &condition) {
+	binder.BindWhereStarExpression(condition);
+}
+
+void Relation::ExpandRelationStar(Binder &binder, unique_ptr<ParsedExpression> expression,
+                                  vector<unique_ptr<ParsedExpression>> &result) {
+	binder.ExpandStarExpression(std::move(expression), result);
+}
+
+void Relation::PlanRelationSubqueries(Binder &binder, unique_ptr<Expression> &expression,
+                                      unique_ptr<LogicalOperator> &root) {
+	binder.PlanSubqueries(expression, root);
 }
 
 shared_ptr<Relation> Relation::InsertRel(const string &schema_name, const string &table_name) {
@@ -679,6 +566,9 @@ string Relation::ToString() {
 
 // LCOV_EXCL_START
 string Relation::GetQuery() {
+	if (!CanSerializeToQueryNode()) {
+		return string();
+	}
 	return GetQueryNode()->ToString();
 }
 

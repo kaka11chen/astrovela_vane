@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation/insert_relation.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -20,6 +26,10 @@ InsertRelation::InsertRelation(shared_ptr<Relation> child_p, string catalog_name
 }
 
 BoundStatement InsertRelation::Bind(Binder &binder) {
+	if (!child->CanSerializeToQueryNode()) {
+		throw NotImplementedException("Cannot insert from a relation that cannot be faithfully represented as a SQL "
+		                              "query node; conversion would discard the exchange or lose relation bindings");
+	}
 	InsertStatement stmt;
 	auto select = make_uniq<SelectStatement>();
 	select->node = child->GetQueryNode();
