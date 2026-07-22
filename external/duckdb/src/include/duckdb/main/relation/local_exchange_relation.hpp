@@ -33,6 +33,9 @@ public:
 	bool ContainsNonSQLRelation() override {
 		return true;
 	}
+	bool CanBindAsInput() override {
+		return child->CanBindAsInput();
+	}
 
 protected:
 	BoundStatement BindAsInput(Binder &binder) override;

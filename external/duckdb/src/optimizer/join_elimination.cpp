@@ -39,7 +39,7 @@ void JoinElimination::OptimizeChildren(LogicalOperator &op, optional_ptr<Logical
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_DISTINCT: {
 		auto &distinct = op.Cast<LogicalDistinct>();
-		if (distinct.distinct_type != DistinctType::DISTINCT) {
+		if (distinct.distinct_type != DistinctType::DISTINCT || distinct.distinct_targets.empty()) {
 			break;
 		}
 		column_binding_set_t distinct_group;
@@ -54,8 +54,14 @@ void JoinElimination::OptimizeChildren(LogicalOperator &op, optional_ptr<Logical
 				break;
 			}
 			auto &col_ref = target->Cast<BoundColumnRefExpression>();
+			if (table_idx != col_ref.binding.table_index) {
+				// Join elimination tracks a distinct group through a single table
+				// binding. A DISTINCT directly over a join can retain bindings from
+				// multiple inputs, so it cannot be represented by this map.
+				can_add = false;
+				break;
+			}
 			distinct_group.insert(col_ref.binding);
-			D_ASSERT(table_idx == col_ref.binding.table_index);
 		}
 		if (can_add) {
 			pipe_info.distinct_groups[table_idx] = std::move(distinct_group);

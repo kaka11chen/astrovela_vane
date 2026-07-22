@@ -122,6 +122,20 @@ static bool OperatorIsNonReorderable(LogicalOperatorType op_type) {
 	}
 }
 
+static bool OperatorIsRelationBoundary(LogicalOperatorType op_type) {
+	switch (op_type) {
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+	case LogicalOperatorType::LOGICAL_LIMIT:
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
+	case LogicalOperatorType::LOGICAL_TOP_N:
+	case LogicalOperatorType::LOGICAL_REPARTITION:
+	case LogicalOperatorType::LOGICAL_LOCAL_EXCHANGE:
+		return true;
+	default:
+		return false;
+	}
+}
+
 bool ExpressionContainsColumnRef(const Expression &root_expr) {
 	bool contains_column_ref = false;
 	ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
@@ -164,7 +178,8 @@ static bool JoinIsReorderable(LogicalOperator &op) {
 static bool HasNonReorderableChild(LogicalOperator &op) {
 	LogicalOperator *tmp = &op;
 	while (tmp->children.size() == 1) {
-		if (OperatorNeedsRelation(tmp->type) || OperatorIsNonReorderable(tmp->type)) {
+		if (OperatorNeedsRelation(tmp->type) || OperatorIsNonReorderable(tmp->type) ||
+		    OperatorIsRelationBoundary(tmp->type)) {
 			return true;
 		}
 		tmp = tmp->children[0].get();
@@ -209,7 +224,7 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 	vector<reference<LogicalOperator>> datasource_filters;
 	optional_ptr<LogicalOperator> limit_op = nullptr;
 	// pass through single child operators
-	while (op->children.size() == 1 && !OperatorNeedsRelation(op->type)) {
+	while (op->children.size() == 1 && !OperatorNeedsRelation(op->type) && !OperatorIsRelationBoundary(op->type)) {
 		if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
 			if (HasNonReorderableChild(*op)) {
 				datasource_filters.push_back(*op);
@@ -221,7 +236,8 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		}
 		op = op->children[0].get();
 	}
-	bool non_reorderable_operation = false;
+	bool relation_boundary = OperatorIsRelationBoundary(op->type);
+	bool non_reorderable_operation = relation_boundary;
 	if (OperatorIsNonReorderable(op->type)) {
 		// set operation, optimize separately in children
 		non_reorderable_operation = true;
@@ -236,7 +252,9 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		}
 	}
 	if (non_reorderable_operation) {
-		// we encountered a non-reordable operation (setop or non-inner join)
+		// We encountered an operation that the surrounding join graph cannot cross. For
+		// row-set and exchange boundaries, optimize the child join graph independently
+		// and retain the entire operator as a single relation in the outer graph.
 		// we do not reorder non-inner joins yet, however we do want to expand the potential join graph around them
 		// non-inner joins are also tricky because we can't freely make conditions through them
 		// e.g. suppose we have (left LEFT OUTER JOIN right WHERE right IS NOT NULL), the join can generate
@@ -252,6 +270,9 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		}
 
 		auto combined_stats = RelationStatisticsHelper::CombineStatsOfNonReorderableOperator(*op, children_stats);
+		if (relation_boundary) {
+			combined_stats.cardinality = op->EstimateCardinality(context);
+		}
 		op->SetEstimatedCardinality(combined_stats.cardinality);
 		if (!datasource_filters.empty()) {
 			combined_stats.cardinality = (idx_t)MaxValue(

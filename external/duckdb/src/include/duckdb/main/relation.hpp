@@ -246,6 +246,12 @@ public:
 		auto child = ChildRelation();
 		return !child || child->CanSerializeToQueryNode();
 	}
+	//! Whether this relation can be bound directly as another relation's input.
+	//! SQL-serializable relations use the default SQL binding path. Relations
+	//! with a non-SQL binding path override this independently of serialization.
+	virtual bool CanBindAsInput() {
+		return CanSerializeToQueryNode();
+	}
 	void AddExternalDependency(shared_ptr<ExternalDependency> dependency);
 	DUCKDB_API vector<shared_ptr<ExternalDependency>> GetAllDependencies();
 
@@ -254,6 +260,7 @@ protected:
 	//! relations override this to keep their child's BindContext aligned with the plan.
 	virtual BoundStatement BindAsInput(Binder &binder);
 	DUCKDB_API static string RenderWhitespace(idx_t depth);
+	DUCKDB_API static bool ExposesMultiSourceBindings(Relation &child);
 	DUCKDB_API static bool RequiresDirectRelationBinding(Relation &child);
 	DUCKDB_API static bool RequiresSQLMultiSourceBinding(Relation &child);
 	DUCKDB_API static bool CanSerializeExpressionOnChild(Relation &child, const ParsedExpression &expression);

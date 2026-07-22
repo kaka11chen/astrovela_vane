@@ -29,7 +29,7 @@ unique_ptr<QueryNode> DistinctRelation::GetQueryNode() {
 }
 
 BoundStatement DistinctRelation::Bind(Binder &binder) {
-	if (!child->ContainsNonSQLRelation()) {
+	if (!RequiresDirectRelationBinding(*child)) {
 		return Relation::Bind(binder);
 	}
 	auto select_node = make_uniq<SelectNode>();

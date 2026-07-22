@@ -9,6 +9,7 @@
 #include "duckdb/common/enums/joinref_type.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/main/relation/explain_relation.hpp"
 #include "duckdb/main/relation/value_relation.hpp"
 #include "iostream"
 #include "test_helpers.hpp"
@@ -1190,6 +1191,37 @@ TEST_CASE("Test create table with empty name", "[relation_api]") {
 
 	auto values = con.Values("(42)");
 	REQUIRE_THROWS_AS(values->Create(""), ParserException);
+}
+
+TEST_CASE("Relation input binding is independent from SQL serialization", "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE binding_left(id INTEGER, value INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO binding_left VALUES (1, 10), (2, 20)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE binding_right(id INTEGER, value INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO binding_right VALUES (1, 100), (2, 200)"));
+
+	auto left = con.Table("binding_left")->Alias("l");
+	auto right = con.Table("binding_right")->Alias("r");
+	auto distinct_join = left->Join(right, "l.id = r.id")->Distinct();
+	REQUIRE_NOTHROW(result = distinct_join->Aggregate("count(*)")->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {2}));
+
+	auto direct_bound = distinct_join->Project("r.value AS x");
+	REQUIRE_FALSE(direct_bound->CanSerializeToQueryNode());
+	REQUIRE(direct_bound->CanBindAsInput());
+	REQUIRE_NOTHROW(result = direct_bound->Filter("x > 100")->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {200}));
+
+	auto exchange = left->LocalExchange(2);
+	REQUIRE_FALSE(exchange->CanSerializeToQueryNode());
+	REQUIRE(exchange->CanBindAsInput());
+
+	auto explain = make_shared_ptr<ExplainRelation>(left);
+	REQUIRE_FALSE(explain->CanSerializeToQueryNode());
+	REQUIRE_FALSE(explain->CanBindAsInput());
 }
 
 TEST_CASE("Test LocalExchange preserved after Limit", "[relation_api][local_exchange]") {

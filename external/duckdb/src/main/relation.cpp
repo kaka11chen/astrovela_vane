@@ -32,10 +32,15 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/recursive_cte_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/tableref/list.hpp"
 #include "duckdb/main/relation/join_relation.hpp"
 #include "duckdb/main/relation/value_relation.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
@@ -287,9 +292,13 @@ BoundStatement Relation::BindAsInput(Binder &binder) {
 }
 
 bool Relation::RequiresDirectRelationBinding(Relation &child) {
-	if (child.ContainsNonSQLRelation()) {
-		return true;
+	if (!child.CanSerializeToQueryNode()) {
+		return child.CanBindAsInput();
 	}
+	return ExposesMultiSourceBindings(child);
+}
+
+bool Relation::ExposesMultiSourceBindings(Relation &child) {
 	auto child_ptr = &child;
 	while (child_ptr->InheritsColumnBindings()) {
 		child_ptr = child_ptr->ChildRelation();
@@ -309,37 +318,270 @@ bool Relation::RequiresSQLMultiSourceBinding(Relation &child) {
 	return child_ptr->type == RelationType::JOIN_RELATION || child_ptr->type == RelationType::CROSS_PRODUCT_RELATION;
 }
 
+namespace {
+
+class SerializedExpressionScopeChecker {
+public:
+	explicit SerializedExpressionScopeChecker(string child_alias_p) : child_alias(std::move(child_alias_p)) {
+	}
+
+	bool Check(const ParsedExpression &expression) {
+		VisitExpression(expression);
+		return serializable;
+	}
+
+private:
+	bool QualifierIsVisible(const string &qualifier) const {
+		if (StringUtil::CIEquals(qualifier, child_alias)) {
+			return true;
+		}
+		for (auto scope = query_scopes.rbegin(); scope != query_scopes.rend(); scope++) {
+			for (auto &alias : *scope) {
+				if (StringUtil::CIEquals(qualifier, alias)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	void VisitExpression(const ParsedExpression &expression) {
+		if (!serializable) {
+			return;
+		}
+		switch (expression.GetExpressionClass()) {
+		case ExpressionClass::COLUMN_REF: {
+			auto &column_ref = expression.Cast<ColumnRefExpression>();
+			if (column_ref.IsQualified() && !QualifierIsVisible(column_ref.GetTableName())) {
+				serializable = false;
+			}
+			return;
+		}
+		case ExpressionClass::STAR: {
+			auto &star = expression.Cast<StarExpression>();
+			auto references_hidden_table = [&](const QualifiedColumnName &column) {
+				return column.IsQualified() && !QualifierIsVisible(column.table);
+			};
+			if ((!star.relation_name.empty() && !QualifierIsVisible(star.relation_name)) ||
+			    std::any_of(star.exclude_list.begin(), star.exclude_list.end(), references_hidden_table) ||
+			    std::any_of(star.rename_list.begin(), star.rename_list.end(),
+			                [&](const auto &entry) { return references_hidden_table(entry.first); })) {
+				serializable = false;
+				return;
+			}
+			break;
+		}
+		case ExpressionClass::SUBQUERY: {
+			auto &subquery = expression.Cast<SubqueryExpression>();
+			if (subquery.child) {
+				VisitExpression(*subquery.child);
+			}
+			if (!subquery.subquery || !subquery.subquery->node) {
+				serializable = false;
+				return;
+			}
+			VisitQueryNode(*subquery.subquery->node);
+			return;
+		}
+		default:
+			break;
+		}
+		ParsedExpressionIterator::EnumerateChildren(expression,
+		                                            [&](const ParsedExpression &child) { VisitExpression(child); });
+	}
+
+	void CollectTableAliases(const TableRef &ref, vector<string> &aliases) {
+		if (!ref.alias.empty()) {
+			aliases.push_back(ref.alias);
+			return;
+		}
+		switch (ref.type) {
+		case TableReferenceType::BASE_TABLE:
+			aliases.push_back(ref.Cast<BaseTableRef>().table_name);
+			break;
+		case TableReferenceType::JOIN: {
+			auto &join = ref.Cast<JoinRef>();
+			CollectTableAliases(*join.left, aliases);
+			CollectTableAliases(*join.right, aliases);
+			break;
+		}
+		case TableReferenceType::TABLE_FUNCTION: {
+			auto &table_function = ref.Cast<TableFunctionRef>();
+			if (table_function.function && table_function.function->GetExpressionClass() == ExpressionClass::FUNCTION) {
+				aliases.push_back(table_function.function->Cast<FunctionExpression>().function_name);
+			}
+			break;
+		}
+		case TableReferenceType::PIVOT:
+			CollectTableAliases(*ref.Cast<PivotRef>().source, aliases);
+			break;
+		default:
+			break;
+		}
+	}
+
+	void VisitTableRef(TableRef &ref) {
+		if (!serializable) {
+			return;
+		}
+		switch (ref.type) {
+		case TableReferenceType::EXPRESSION_LIST: {
+			auto &expression_list = ref.Cast<ExpressionListRef>();
+			for (auto &row : expression_list.values) {
+				for (auto &expression : row) {
+					VisitExpression(*expression);
+				}
+			}
+			break;
+		}
+		case TableReferenceType::JOIN: {
+			auto &join = ref.Cast<JoinRef>();
+			VisitTableRef(*join.left);
+			VisitTableRef(*join.right);
+			if (join.condition) {
+				VisitExpression(*join.condition);
+			}
+			for (auto &expression : join.duplicate_eliminated_columns) {
+				VisitExpression(*expression);
+			}
+			break;
+		}
+		case TableReferenceType::PIVOT: {
+			auto &pivot = ref.Cast<PivotRef>();
+			VisitTableRef(*pivot.source);
+			for (auto &aggregate : pivot.aggregates) {
+				VisitExpression(*aggregate);
+			}
+			for (auto &column : pivot.pivots) {
+				for (auto &expression : column.pivot_expressions) {
+					VisitExpression(*expression);
+				}
+				for (auto &entry : column.entries) {
+					if (entry.expr) {
+						VisitExpression(*entry.expr);
+					}
+				}
+				if (column.subquery) {
+					VisitQueryNode(*column.subquery);
+				}
+			}
+			break;
+		}
+		case TableReferenceType::SUBQUERY: {
+			auto &subquery = ref.Cast<SubqueryRef>();
+			VisitQueryNode(*subquery.subquery->node);
+			break;
+		}
+		case TableReferenceType::TABLE_FUNCTION: {
+			auto &table_function = ref.Cast<TableFunctionRef>();
+			VisitExpression(*table_function.function);
+			if (table_function.subquery) {
+				VisitQueryNode(*table_function.subquery->node);
+			}
+			break;
+		}
+		case TableReferenceType::SHOW_REF: {
+			auto &show = ref.Cast<ShowRef>();
+			if (show.query) {
+				VisitQueryNode(*show.query);
+			}
+			break;
+		}
+		case TableReferenceType::BASE_TABLE:
+		case TableReferenceType::EMPTY_FROM:
+		case TableReferenceType::COLUMN_DATA:
+		case TableReferenceType::DELIM_GET:
+			break;
+		default:
+			serializable = false;
+			break;
+		}
+	}
+
+	void VisitQueryNode(QueryNode &node) {
+		if (!serializable) {
+			return;
+		}
+		for (auto &entry : node.cte_map.map) {
+			VisitQueryNode(*entry.second->query->node);
+		}
+		switch (node.type) {
+		case QueryNodeType::SELECT_NODE: {
+			auto &select = node.Cast<SelectNode>();
+			vector<string> aliases;
+			if (select.from_table) {
+				CollectTableAliases(*select.from_table, aliases);
+			}
+			query_scopes.push_back(std::move(aliases));
+			for (auto &expression : select.select_list) {
+				VisitExpression(*expression);
+			}
+			for (auto &expression : select.groups.group_expressions) {
+				VisitExpression(*expression);
+			}
+			if (select.where_clause) {
+				VisitExpression(*select.where_clause);
+			}
+			if (select.having) {
+				VisitExpression(*select.having);
+			}
+			if (select.qualify) {
+				VisitExpression(*select.qualify);
+			}
+			if (select.from_table) {
+				VisitTableRef(*select.from_table);
+			}
+			ParsedExpressionIterator::EnumerateQueryNodeModifiers(
+			    node, [&](unique_ptr<ParsedExpression> &expression) { VisitExpression(*expression); });
+			query_scopes.pop_back();
+			break;
+		}
+		case QueryNodeType::SET_OPERATION_NODE: {
+			auto &set_operation = node.Cast<SetOperationNode>();
+			for (auto &child : set_operation.children) {
+				VisitQueryNode(*child);
+			}
+			ParsedExpressionIterator::EnumerateQueryNodeModifiers(
+			    node, [&](unique_ptr<ParsedExpression> &expression) { VisitExpression(*expression); });
+			break;
+		}
+		case QueryNodeType::RECURSIVE_CTE_NODE: {
+			auto &recursive_cte = node.Cast<RecursiveCTENode>();
+			VisitQueryNode(*recursive_cte.left);
+			VisitQueryNode(*recursive_cte.right);
+			for (auto &target : recursive_cte.key_targets) {
+				VisitExpression(*target);
+			}
+			ParsedExpressionIterator::EnumerateQueryNodeModifiers(
+			    node, [&](unique_ptr<ParsedExpression> &expression) { VisitExpression(*expression); });
+			break;
+		}
+		default:
+			serializable = false;
+			break;
+		}
+	}
+
+private:
+	string child_alias;
+	vector<vector<string>> query_scopes;
+	bool serializable = true;
+};
+
+} // namespace
+
 bool Relation::CanSerializeExpressionOnChild(Relation &child, const ParsedExpression &expression) {
 	if (!child.CanSerializeToQueryNode()) {
 		return false;
 	}
-	if (!RequiresDirectRelationBinding(child) || RequiresSQLMultiSourceBinding(child)) {
+	if (!ExposesMultiSourceBindings(child) || RequiresSQLMultiSourceBinding(child)) {
 		return true;
 	}
 
-	// A semantic boundary above a join is emitted as a subquery. Only the
-	// subquery alias survives that boundary; qualified references to the join's
-	// original inputs would produce SQL that cannot bind.
-	auto child_alias = child.GetAlias();
-	bool serializable = true;
-	ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(
-	    expression, [&](const ColumnRefExpression &column_ref) {
-		    if (column_ref.IsQualified() && !StringUtil::CIEquals(column_ref.GetTableName(), child_alias)) {
-			    serializable = false;
-		    }
-	    });
-	ParsedExpressionIterator::VisitExpression<StarExpression>(expression, [&](const StarExpression &star) {
-		auto references_other_table = [&](const QualifiedColumnName &column) {
-			return column.IsQualified() && !StringUtil::CIEquals(column.table, child_alias);
-		};
-		if ((!star.relation_name.empty() && !StringUtil::CIEquals(star.relation_name, child_alias)) ||
-		    std::any_of(star.exclude_list.begin(), star.exclude_list.end(), references_other_table) ||
-		    std::any_of(star.rename_list.begin(), star.rename_list.end(),
-		                [&](const auto &entry) { return references_other_table(entry.first); })) {
-			serializable = false;
-		}
-	});
-	return serializable;
+	// A semantic boundary above a join is emitted as a subquery. Check every
+	// qualified reference against the aliases that survive that boundary and
+	// against aliases introduced by nested query scopes.
+	return SerializedExpressionScopeChecker(child.GetAlias()).Check(expression);
 }
 
 unique_ptr<TableRef> Relation::BindRelationInput(Binder &binder, Relation &child) {

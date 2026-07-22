@@ -42,6 +42,9 @@ public:
 		return child.get();
 	}
 	bool CanSerializeToQueryNode() override;
+	bool CanBindAsInput() override {
+		return child->CanBindAsInput();
+	}
 
 protected:
 	BoundStatement BindAsInput(Binder &binder) override;

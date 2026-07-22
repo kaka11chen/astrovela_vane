@@ -54,6 +54,9 @@ public:
 	bool CanSerializeToQueryNode() override {
 		return !input_relation || input_relation->CanSerializeToQueryNode();
 	}
+	bool CanBindAsInput() override {
+		return !input_relation || input_relation->CanBindAsInput();
+	}
 
 private:
 	void InitializeColumns();

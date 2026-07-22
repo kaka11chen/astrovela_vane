@@ -53,7 +53,7 @@ string LimitRelation::ToString(idx_t depth) {
 }
 
 BoundStatement LimitRelation::Bind(Binder &binder) {
-	if (!child->ContainsNonSQLRelation()) {
+	if (!RequiresDirectRelationBinding(*child)) {
 		return Relation::Bind(binder);
 	}
 	auto select_node = make_uniq<SelectNode>();

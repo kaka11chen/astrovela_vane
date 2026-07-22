@@ -44,6 +44,9 @@ public:
 		return child->ContainsNonSQLRelation();
 	}
 	bool CanSerializeToQueryNode() override;
+	bool CanBindAsInput() override {
+		return child->CanBindAsInput();
+	}
 };
 
 } // namespace duckdb

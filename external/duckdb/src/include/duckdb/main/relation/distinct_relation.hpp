@@ -39,6 +39,9 @@ public:
 	Relation *ChildRelation() override {
 		return child.get();
 	}
+	bool CanBindAsInput() override {
+		return child->CanBindAsInput();
+	}
 
 protected:
 	BoundStatement BindAsInput(Binder &binder) override;

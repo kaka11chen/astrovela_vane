@@ -136,6 +136,30 @@ def test_aggregate_preserves_exchange(duckdb_cursor, exchange_method, plan_node,
     assert sorted(result.fetchall()) == expected
 
 
+@pytest.mark.parametrize(
+    ("exchange_method", "plan_node"),
+    [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
+)
+@pytest.mark.parametrize("operation", ["project", "filter", "order"])
+def test_exchange_over_join_survives_uncorrelated_subquery(duckdb_cursor, exchange_method, plan_node, operation):
+    left = duckdb_cursor.sql("SELECT * FROM (VALUES (1), (2)) data(id)").set_alias("left_data")
+    right = duckdb_cursor.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(id, value)").set_alias("right_data")
+    relation = getattr(left.join(right, "left_data.id = right_data.id"), exchange_method)(2)
+
+    if operation == "project":
+        result = relation.project("right_data.value + (SELECT 1) AS value")
+        expected = [(11,), (21,)]
+    elif operation == "filter":
+        result = relation.filter("(SELECT true)")
+        expected = [(1, 1, 10), (2, 2, 20)]
+    else:
+        result = relation.order("(SELECT 1)")
+        expected = [(1, 1, 10), (2, 2, 20)]
+
+    assert plan_node in result.explain()
+    assert sorted(result.fetchall()) == expected
+
+
 @pytest.mark.parametrize("exchange_method", ["repartition", "local_exchange"])
 @pytest.mark.parametrize("operation", ["join", "cross", "union", "except", "intersect"])
 def test_binary_relational_operations_fail_before_discarding_exchange(duckdb_cursor, exchange_method, operation):

@@ -259,6 +259,125 @@ class TestRAPIJoins:
         with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM relation")
 
+    @pytest.mark.parametrize("operation", ["filter", "order", "project", "aggregate", "distinct", "limit", "alias"])
+    def test_direct_bound_projection_remains_chainable(self, con, operation):
+        left = con.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(id, left_value)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1, 100), (2, 200)) data(id, right_value)").set_alias("r")
+        relation = left.join(right, "l.id = r.id").distinct().project("r.right_value AS x")
+
+        if operation == "filter":
+            result = relation.filter("x > 100")
+        elif operation == "order":
+            result = relation.order("x DESC")
+        elif operation == "project":
+            result = relation.project("x + 1 AS y")
+        elif operation == "aggregate":
+            result = relation.aggregate("sum(x)")
+        elif operation == "distinct":
+            result = relation.distinct()
+        elif operation == "limit":
+            result = relation.limit(1)
+        else:
+            result = relation.set_alias("projected").filter("projected.x >= 100")
+
+        rows = result.fetchall()
+        assert result.sql_query() == ""
+        if operation == "filter":
+            assert rows == [(200,)]
+        elif operation == "order":
+            assert rows == [(200,), (100,)]
+        elif operation == "project":
+            assert sorted(rows) == [(101,), (201,)]
+        elif operation == "aggregate":
+            assert rows == [(300,)]
+        elif operation == "limit":
+            assert len(rows) == 1
+            assert rows[0] in {(100,), (200,)}
+        else:
+            assert sorted(rows) == [(100,), (200,)]
+
+    @pytest.mark.parametrize("boundary", ["distinct", "limit", "order"])
+    def test_correlated_subquery_after_join_boundary_is_not_serialized(self, con, boundary):
+        left = con.sql("SELECT * FROM (VALUES (1, 10)) data(id, left_value)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1, 20)) data(id, right_value)").set_alias("r")
+        relation = left.join(right, "l.id = r.id")
+        if boundary == "distinct":
+            relation = relation.distinct()
+        elif boundary == "limit":
+            relation = relation.limit(1)
+        else:
+            relation = relation.order("r.right_value")
+        relation = relation.project("(SELECT r.right_value) AS value")
+
+        assert relation.fetchall() == [(20,)]
+        assert relation.sql_query() == ""
+
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM relation")
+
+    def test_explicit_alias_restores_serializable_scope_for_correlated_subquery(self, con):
+        left = con.sql("SELECT * FROM (VALUES (1, 10)) data(id, left_value)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1, 20)) data(id, right_value)").set_alias("r")
+        relation = (
+            left.join(right, "l.id = r.id")
+            .distinct()
+            .set_alias("joined")
+            .project("(SELECT joined.right_value) AS value")
+        )
+
+        sql = relation.sql_query()
+        assert sql
+        assert con.sql(sql).fetchall() == relation.fetchall() == [(20,)]
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("(SELECT 42) AS value", [(42,), (42,)]),
+            ("(SELECT r.value FROM (VALUES (42)) r(value)) AS value", [(42,), (42,)]),
+            ("(SELECT (SELECT r.value) FROM (VALUES (42)) r(value)) AS value", [(42,), (42,)]),
+        ],
+    )
+    def test_uncorrelated_subquery_after_join_boundary_remains_serializable(self, con, expression, expected):
+        left = con.sql("SELECT * FROM (VALUES (1), (2)) data(id)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1), (2)) data(id)").set_alias("r")
+        relation = left.join(right, "l.id = r.id").distinct().project(expression)
+
+        sql = relation.sql_query()
+        assert sql
+        assert relation.fetchall() == expected
+        assert con.sql(sql).fetchall() == expected
+
+    @pytest.mark.parametrize("boundary", ["distinct", "limit", "order"])
+    def test_join_boundary_survives_uncorrelated_subquery(self, con, boundary):
+        left = con.sql("SELECT * FROM (VALUES (1), (1), (2)) data(id)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(id, value)").set_alias("r")
+        relation = left.join(right, "l.id = r.id")
+        if boundary == "distinct":
+            relation = relation.distinct()
+            expected = [(10,), (20,)]
+        elif boundary == "limit":
+            relation = relation.limit(1)
+            expected = [(10,)]
+        else:
+            relation = relation.order("r.value DESC")
+            expected = [(20,), (10,), (10,)]
+
+        result = relation.project("r.value + (SELECT 0) AS value")
+
+        rows = result.fetchall()
+        if boundary == "distinct":
+            assert sorted(rows) == expected
+        else:
+            assert rows == expected
+
+    def test_distinct_join_can_feed_aggregate(self, con):
+        left = con.sql("SELECT * FROM (VALUES (1), (1), (2)) data(id)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(id, value)").set_alias("r")
+
+        result = left.join(right, "l.id = r.id").distinct().aggregate("count(*)")
+
+        assert result.fetchall() == [(2,)]
+
     def test_explicit_alias_restores_serializable_scope_after_join_boundary(self, con):
         left = con.sql("SELECT * FROM (VALUES (1, 10)) data(id, left_value)").set_alias("l")
         right = con.sql("SELECT * FROM (VALUES (1, 20)) data(id, right_value)").set_alias("r")
