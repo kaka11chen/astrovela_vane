@@ -1578,8 +1578,7 @@ def _has_replacement_fte_worker(
 # 1. Scheduler and registry locks protect queues/snapshots only and are released
 #    before fragment state is inspected.
 # 2. A thread may hold one fragment state lock at a time.
-# 3. Global fragment traversal and external admission callbacks run with no
-#    fragment state lock held.
+# 3. Global fragment traversal runs with no fragment state lock held.
 def _assert_no_fte_fragment_state_lock_held(
     fragment_execution_items: list[tuple[tuple[str, str], FteFragmentExecution]],
 ) -> None:
