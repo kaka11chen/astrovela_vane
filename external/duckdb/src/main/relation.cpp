@@ -594,7 +594,14 @@ unique_ptr<TableRef> Relation::BindRelationInput(Binder &binder, Relation &child
 
 	bool multi_source = child.type == RelationType::JOIN_RELATION || child.type == RelationType::CROSS_PRODUCT_RELATION;
 	bool preserves_bindings = child.InheritsColumnBindings() || multi_source;
-	if (!preserves_bindings) {
+	if (preserves_bindings) {
+		// The bind context is authoritative for the columns that survive an
+		// operator. JoinRef binding retains both inputs in BoundStatement metadata
+		// even when SEMI/ANTI joins remove one side from the output.
+		child_bound.names.clear();
+		child_bound.types.clear();
+		child_binder->bind_context.GetTypesAndNames(child_bound.names, child_bound.types);
+	} else {
 		// Projections, aggregates, and explicit aliases establish a new scope.
 		// Rebase that scope on the bound plan's single output table index.
 		auto input_binder = Binder::CreateBinder(binder.context, binder.shared_from_this());
@@ -620,16 +627,6 @@ unique_ptr<LogicalOperator> Relation::PlanRelationFilter(Binder &binder, unique_
 
 void Relation::ExpandRelationFilter(Binder &binder, unique_ptr<ParsedExpression> &condition) {
 	binder.BindWhereStarExpression(condition);
-}
-
-void Relation::ExpandRelationStar(Binder &binder, unique_ptr<ParsedExpression> expression,
-                                  vector<unique_ptr<ParsedExpression>> &result) {
-	binder.ExpandStarExpression(std::move(expression), result);
-}
-
-void Relation::PlanRelationSubqueries(Binder &binder, unique_ptr<Expression> &expression,
-                                      unique_ptr<LogicalOperator> &root) {
-	binder.PlanSubqueries(expression, root);
 }
 
 shared_ptr<Relation> Relation::InsertRel(const string &schema_name, const string &table_name) {

@@ -42,12 +42,13 @@ BoundStatement DistinctRelation::BindAsInput(Binder &binder) {
 	auto child_ref = BindRelationInput(binder, *child);
 	auto child_bound = binder.Bind(*child_ref);
 	auto bindings = child_bound.plan->GetColumnBindings();
-	D_ASSERT(bindings.size() == child_bound.names.size());
-	D_ASSERT(bindings.size() == child_bound.types.size());
+	if (child_bound.names.size() != child_bound.types.size() || bindings.size() < child_bound.names.size()) {
+		throw InternalException("Distinct relation input metadata does not match its visible column bindings");
+	}
 
 	vector<unique_ptr<Expression>> targets;
-	targets.reserve(bindings.size());
-	for (idx_t i = 0; i < bindings.size(); i++) {
+	targets.reserve(child_bound.names.size());
+	for (idx_t i = 0; i < child_bound.names.size(); i++) {
 		unique_ptr<Expression> target =
 		    make_uniq<BoundColumnRefExpression>(child_bound.names[i], child_bound.types[i], bindings[i]);
 		ExpressionBinder::PushCollation(binder.context, target, target->return_type);

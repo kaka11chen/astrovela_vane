@@ -8,13 +8,29 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
-#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
-#include "duckdb/main/config.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 
 namespace duckdb {
+
+static void InlineOrderProjection(unique_ptr<Expression> &expression, const LogicalProjection &projection) {
+	if (expression->type == ExpressionType::BOUND_COLUMN_REF) {
+		auto &column_ref = expression->Cast<BoundColumnRefExpression>();
+		if (column_ref.binding.table_index == projection.table_index) {
+			if (column_ref.binding.column_index >= projection.expressions.size()) {
+				throw InternalException("Order relation projection reference is out of range");
+			}
+			expression = projection.expressions[column_ref.binding.column_index]->Copy();
+			return;
+		}
+	}
+	ExpressionIterator::EnumerateChildren(
+	    *expression, [&](unique_ptr<Expression> &child) { InlineOrderProjection(child, projection); });
+}
 
 OrderRelation::OrderRelation(shared_ptr<Relation> child_p, vector<OrderByNode> orders)
     : Relation(child_p->context, RelationType::ORDER_RELATION), orders(std::move(orders)), child(std::move(child_p)) {
@@ -58,43 +74,44 @@ BoundStatement OrderRelation::Bind(Binder &binder) {
 }
 
 BoundStatement OrderRelation::BindAsInput(Binder &binder) {
-	auto child_ref = BindRelationInput(binder, *child);
-	auto child_bound = binder.Bind(*child_ref);
-	vector<unique_ptr<ParsedExpression>> visible_columns;
-	ExpandRelationStar(binder, make_uniq<StarExpression>(), visible_columns);
-
-	auto &config = DBConfig::GetConfig(binder.context);
-	ExpressionBinder expression_binder(binder, binder.context);
-	vector<BoundOrderByNode> bound_orders;
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list.push_back(make_uniq<StarExpression>());
+	auto order_node = make_uniq<OrderModifier>();
 	for (auto &order : orders) {
-		auto order_type = config.ResolveOrder(binder.context, order.type);
-		auto null_order = config.ResolveNullOrder(binder.context, order_type, order.null_order);
-		vector<unique_ptr<ParsedExpression>> order_expressions;
-		ExpandRelationStar(binder, order.expression->Copy(), order_expressions);
-		for (auto &expression : order_expressions) {
-			if (expression->GetExpressionClass() == ExpressionClass::CONSTANT) {
-				auto &constant = expression->Cast<ConstantExpression>();
-				if (constant.value.type().IsIntegral()) {
-					auto position = constant.value.GetValue<int64_t>();
-					if (position <= 0 || static_cast<idx_t>(position) > visible_columns.size()) {
-						throw BinderException("ORDER BY position %lld is not in select list", position);
-					}
-					expression = visible_columns[static_cast<idx_t>(position - 1)]->Copy();
-				}
-			}
+		order_node->orders.emplace_back(order.type, order.null_order, order.expression->Copy());
+	}
+	select_node->modifiers.push_back(std::move(order_node));
+	auto result = BindSelectNodeOnChild(binder, *child, std::move(select_node));
 
-			auto bound_expression = expression_binder.Bind(expression);
-			ExpressionBinder::PushCollation(binder.context, bound_expression, bound_expression->return_type);
-			bound_orders.emplace_back(order_type, null_order, std::move(bound_expression));
-		}
+	// The SELECT binder evaluates ORDER BY-only expressions in a temporary
+	// projection. Inline those expressions into the LogicalOrder and remove the
+	// projection so the child's table bindings remain visible to later relation
+	// operators. Window, UNNEST, and subquery plan nodes below it are retained.
+	auto root = std::move(result.plan);
+	if (root->type == LogicalProjection::TYPE && root->children.size() == 1 &&
+	    root->children[0]->type == LogicalOrder::TYPE) {
+		root = std::move(root->children[0]);
 	}
-	for (auto &order : bound_orders) {
-		PlanRelationSubqueries(binder, order.expression, child_bound.plan);
+	if (root->type == LogicalProjection::TYPE) {
+		D_ASSERT(root->children.size() == 1);
+		result.plan = std::move(root->children[0]);
+		return result;
 	}
-	auto order = make_uniq<LogicalOrder>(std::move(bound_orders));
-	order->AddChild(std::move(child_bound.plan));
-	child_bound.plan = std::move(order);
-	return child_bound;
+	if (root->type != LogicalOrder::TYPE || root->children.size() != 1 ||
+	    root->children[0]->type != LogicalProjection::TYPE) {
+		throw InternalException("Unexpected logical plan for an order relation");
+	}
+
+	auto &logical_order = root->Cast<LogicalOrder>();
+	auto projection_op = std::move(root->children[0]);
+	auto &projection = projection_op->Cast<LogicalProjection>();
+	D_ASSERT(projection.children.size() == 1);
+	for (auto &order : logical_order.orders) {
+		InlineOrderProjection(order.expression, projection);
+	}
+	root->children[0] = std::move(projection.children[0]);
+	result.plan = std::move(root);
+	return result;
 }
 
 bool OrderRelation::CanSerializeToQueryNode() {

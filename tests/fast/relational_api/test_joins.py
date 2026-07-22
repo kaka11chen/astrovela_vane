@@ -377,6 +377,29 @@ class TestRAPIJoins:
 
         assert result.fetchall() == [(2,)]
 
+    @pytest.mark.parametrize("join_type", ["semi", "anti"])
+    def test_distinct_semi_anti_join_uses_surviving_output(self, con, join_type):
+        left = con.sql("SELECT * FROM (VALUES (1, 'one'), (2, 'two'), (2, 'two')) data(id, value)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1), (3)) data(id)").set_alias("r")
+
+        result = left.join(right, "l.id = r.id", join_type).distinct().project("l.id, l.value")
+
+        expected = [(1, "one")] if join_type == "semi" else [(2, "two")]
+        assert result.fetchall() == expected
+
+    @pytest.mark.parametrize("consumer", ["limit", "distinct"])
+    def test_window_order_over_join_remains_chainable(self, con, consumer):
+        left = con.sql("SELECT * FROM (VALUES (1), (1), (2)) data(id)").set_alias("l")
+        right = con.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(id, value)").set_alias("r")
+        ordered = left.join(right, "l.id = r.id").order("row_number() OVER (ORDER BY l.id DESC)")
+
+        if consumer == "limit":
+            result = ordered.limit(1).project("l.id, r.value")
+            assert result.fetchall() == [(2, 20)]
+        else:
+            result = ordered.distinct().project("l.id, r.value").order("1")
+            assert result.fetchall() == [(1, 10), (2, 20)]
+
     def test_explicit_alias_restores_serializable_scope_after_join_boundary(self, con):
         left = con.sql("SELECT * FROM (VALUES (1, 10)) data(id, left_value)").set_alias("l")
         right = con.sql("SELECT * FROM (VALUES (1, 20)) data(id, right_value)").set_alias("r")

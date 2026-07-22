@@ -270,10 +270,6 @@ protected:
 	DUCKDB_API static unique_ptr<LogicalOperator> PlanRelationFilter(Binder &binder, unique_ptr<Expression> condition,
 	                                                                 unique_ptr<LogicalOperator> child);
 	DUCKDB_API static void ExpandRelationFilter(Binder &binder, unique_ptr<ParsedExpression> &condition);
-	DUCKDB_API static void ExpandRelationStar(Binder &binder, unique_ptr<ParsedExpression> expression,
-	                                          vector<unique_ptr<ParsedExpression>> &result);
-	DUCKDB_API static void PlanRelationSubqueries(Binder &binder, unique_ptr<Expression> &expression,
-	                                              unique_ptr<LogicalOperator> &root);
 
 public:
 	template <class TARGET>

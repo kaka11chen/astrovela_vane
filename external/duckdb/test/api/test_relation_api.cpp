@@ -1222,6 +1222,41 @@ TEST_CASE("Relation input binding is independent from SQL serialization", "[rela
 	auto explain = make_shared_ptr<ExplainRelation>(left);
 	REQUIRE_FALSE(explain->CanSerializeToQueryNode());
 	REQUIRE_FALSE(explain->CanBindAsInput());
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE semi_left(left_id INTEGER, left_value VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO semi_left VALUES (1, 'one'), (2, 'two'), (2, 'two')"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE semi_right(right_id INTEGER, right_value BIGINT)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO semi_right VALUES (1, 100), (3, 300), (3, 300)"));
+	auto semi_left = con.Table("semi_left")->Alias("sl");
+	auto semi_right = con.Table("semi_right")->Alias("sr");
+
+	auto left_semi = semi_left->Join(semi_right, "sl.left_id = sr.right_id", JoinType::SEMI)
+	                     ->Distinct()
+	                     ->Project("sl.left_id, sl.left_value");
+	REQUIRE_NOTHROW(result = left_semi->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE(CHECK_COLUMN(result, 1, {"one"}));
+
+	auto left_anti = semi_left->Join(semi_right, "sl.left_id = sr.right_id", JoinType::ANTI)
+	                     ->Distinct()
+	                     ->Project("sl.left_id, sl.left_value");
+	REQUIRE_NOTHROW(result = left_anti->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {2}));
+	REQUIRE(CHECK_COLUMN(result, 1, {"two"}));
+
+	auto right_semi = semi_left->Join(semi_right, "sl.left_id = sr.right_id", JoinType::RIGHT_SEMI)
+	                      ->Distinct()
+	                      ->Project("sr.right_id, sr.right_value");
+	REQUIRE_NOTHROW(result = right_semi->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE(CHECK_COLUMN(result, 1, {100}));
+
+	auto right_anti = semi_left->Join(semi_right, "sl.left_id = sr.right_id", JoinType::RIGHT_ANTI)
+	                      ->Distinct()
+	                      ->Project("sr.right_id, sr.right_value");
+	REQUIRE_NOTHROW(result = right_anti->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {3}));
+	REQUIRE(CHECK_COLUMN(result, 1, {300}));
 }
 
 TEST_CASE("Test LocalExchange preserved after Limit", "[relation_api][local_exchange]") {
