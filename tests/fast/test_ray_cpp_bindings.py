@@ -29,6 +29,59 @@ def _make_test_physical_plan(con=None):
     ).to_physical_plan(con)
 
 
+@pytest.mark.parametrize("should_fail", [False, True], ids=["success", "failure"])
+def test_ray_backed_result_partition_materialization_is_single_flight(should_fail):
+    script = textwrap.dedent(
+        f"""
+        import json
+        import time
+
+        import duckdb
+        import pyarrow as pa
+
+        should_fail = {should_fail!r}
+
+        class Payload:
+            def __init__(self):
+                self.calls = 0
+
+            def to_arrow(self):
+                self.calls += 1
+                time.sleep(0.2)
+                if should_fail:
+                    raise RuntimeError("materialization boom")
+                return pa.table({{"value": [1, 2, 3]}})
+
+        payload = Payload()
+        result = duckdb.ray_cxx.ray_backed_result_partition_materialization_for_test(payload, 8)
+        print(json.dumps({{"calls": payload.calls, "result": result}}, sort_keys=True))
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode == 0, f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    observed = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert observed["calls"] == 1
+
+    result = observed["result"]
+    if should_fail:
+        assert result["row_counts"] == [0] * 8
+        assert result["same_collection"] is False
+        assert all("materialization boom" in error for error in result["errors"])
+    else:
+        assert result["row_counts"] == [3] * 8
+        assert result["errors"] == [""] * 8
+        assert result["same_collection"] is True
+        assert result["num_rows"] == 3
+        assert result["size_bytes"] > 0
+
+
 def test_distributed_physical_plan_inspectors():
     con = duckdb.connect()
     plan = _make_test_physical_plan(con)

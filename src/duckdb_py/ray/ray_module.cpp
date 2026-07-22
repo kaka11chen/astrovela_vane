@@ -137,6 +137,79 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def_readonly("num_rows", &NativePartitionMetadata::num_rows)
 	    .def_readonly("size_bytes", &NativePartitionMetadata::size_bytes);
 
+	m.def(
+	    "ray_backed_result_partition_materialization_for_test",
+	    [](py::object payload, size_t thread_count) {
+		    using duckdb::distributed::python::ray::RayBackedResultPartition;
+
+		    if (thread_count < 2 || thread_count > 64) {
+			    throw InvalidInputException("thread_count must be between 2 and 64");
+		    }
+
+		    auto partition = std::make_shared<RayBackedResultPartition>(std::move(payload), 0, 0, py::none());
+		    std::vector<std::shared_ptr<ColumnDataCollection>> collections(thread_count);
+		    std::vector<std::string> errors(thread_count);
+		    std::atomic<size_t> ready_count {0};
+		    std::atomic<bool> start {false};
+		    std::vector<std::thread> threads;
+		    threads.reserve(thread_count);
+
+		    for (size_t thread_idx = 0; thread_idx < thread_count; thread_idx++) {
+			    threads.emplace_back([&, thread_idx]() {
+				    ready_count.fetch_add(1, std::memory_order_release);
+				    while (!start.load(std::memory_order_acquire)) {
+					    std::this_thread::yield();
+				    }
+				    try {
+					    PythonGILWrapper gil;
+					    collections[thread_idx] = partition->to_column_data();
+				    } catch (const std::exception &ex) {
+					    errors[thread_idx] = ex.what();
+				    } catch (...) {
+					    errors[thread_idx] = "unknown materialization error";
+				    }
+			    });
+		    }
+
+		    while (ready_count.load(std::memory_order_acquire) != thread_count) {
+			    std::this_thread::yield();
+		    }
+		    {
+			    py::gil_scoped_release release;
+			    start.store(true, std::memory_order_release);
+			    for (auto &thread : threads) {
+				    thread.join();
+			    }
+		    }
+
+		    py::list row_counts;
+		    py::list materialization_errors;
+		    const ColumnDataCollection *first_collection = nullptr;
+		    bool same_collection = true;
+		    for (size_t thread_idx = 0; thread_idx < thread_count; thread_idx++) {
+			    auto &collection = collections[thread_idx];
+			    row_counts.append(collection ? collection->Count() : 0);
+			    materialization_errors.append(errors[thread_idx]);
+			    if (!collection) {
+				    same_collection = false;
+			    } else if (!first_collection) {
+				    first_collection = collection.get();
+			    } else if (collection.get() != first_collection) {
+				    same_collection = false;
+			    }
+		    }
+
+		    py::dict result;
+		    result["row_counts"] = std::move(row_counts);
+		    result["errors"] = std::move(materialization_errors);
+		    result["same_collection"] = same_collection;
+		    result["num_rows"] = partition->num_rows().value();
+		    result["size_bytes"] = partition->size_bytes().value();
+		    return result;
+	    },
+	    py::arg("payload"), py::arg("thread_count") = 8,
+	    "Exercise concurrent Ray-backed result materialization from GIL-owning native threads.");
+
 	py::class_<NativeDistributedTaskResult>(m, "NativeDistributedTaskResult")
 	    .def(py::init<py::iterable, py::iterable, py::object, py::object, std::string, int, py::object, py::object>(),
 	         py::arg("partition_payloads"), py::arg("partition_metadatas"), py::arg("result_schema"), py::arg("stats"),
