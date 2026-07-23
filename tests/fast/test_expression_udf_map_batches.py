@@ -520,7 +520,7 @@ def test_vane_function_batch_streaming_output_is_sliced_before_grouped_aggregate
         def record_batch_size(table):
             return pa.table({"seen": [table.num_rows] * table.num_rows})
 
-        vane.configure(runner="local-fast")
+        vane.configure(runner="local")
         con = vane.connect()
         relation = con.sql("SELECT i::INTEGER AS x FROM range(5000) t(i)")
         expression = vane.func.batch(
@@ -558,7 +558,7 @@ def test_vane_function_batch_row_preserving_batch_size_is_backend_independent():
     def record_batch_size(table):
         return pa.table({"seen": [table.num_rows] * table.num_rows})
 
-    vane.configure(runner="local-fast")
+    vane.configure(runner="local")
     con = vane.connect()
     relation = con.sql("SELECT i::INTEGER AS x FROM range(5000) t(i)")
     expression = vane.func.batch(
