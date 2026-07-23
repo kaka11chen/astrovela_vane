@@ -280,16 +280,6 @@ unique_ptr<TableRef> Relation::GetTableRefForSerialization(Relation &relation) {
 	return relation.GetTableRefInternal();
 }
 
-bool Relation::CanSerializeToQueryNode() {
-	bool result = false;
-	auto client_context = context->GetContext();
-	client_context->RunFunctionInTransaction([&]() {
-		auto binder = Binder::CreateBinder(*client_context);
-		result = CanSerializeToQueryNodeInternal(*binder);
-	});
-	return result;
-}
-
 unique_ptr<QueryNode> Relation::TryGetSerializableQueryNode() {
 	unique_ptr<QueryNode> result;
 	auto client_context = context->GetContext();
@@ -305,16 +295,6 @@ unique_ptr<QueryNode> Relation::TryGetSerializableQueryNode(Binder &binder) {
 		return nullptr;
 	}
 	return GetQueryNode();
-}
-
-bool Relation::CanBindAsInput() {
-	bool result = false;
-	auto client_context = context->GetContext();
-	client_context->RunFunctionInTransaction([&]() {
-		auto binder = Binder::CreateBinder(*client_context);
-		result = CanBindAsInputInternal(*binder);
-	});
-	return result;
 }
 
 unique_ptr<QueryResult> Relation::Execute() {
@@ -372,8 +352,6 @@ bool Relation::RequiresSQLMultiSourceBinding(Relation &child) {
 	}
 	return child_ptr->type == RelationType::JOIN_RELATION || child_ptr->type == RelationType::CROSS_PRODUCT_RELATION;
 }
-
-namespace {
 
 class SerializedExpressionScopeChecker {
 public:
@@ -707,7 +685,7 @@ private:
 		if (relation.type == RelationType::TABLE_RELATION) {
 			binding.columns.emplace_back("rowid");
 		} else if (relation.type == RelationType::TABLE_FUNCTION_RELATION) {
-			for (auto &column_name : relation.Cast<TableFunctionRelation>().GetVirtualColumnNames()) {
+			for (auto &column_name : relation.Cast<TableFunctionRelation>().virtual_column_names) {
 				binding.columns.push_back(column_name);
 			}
 		}
@@ -834,8 +812,6 @@ private:
 	vector<vector<ColumnBinding>> serialized_output_origins;
 	bool serializable = true;
 };
-
-} // namespace
 
 bool Relation::CanSerializeExpressionOnBoundChild(Binder &binder, Relation &child, TableRef &bound_child,
                                                   const ParsedExpression &expression) {
@@ -1116,6 +1092,9 @@ string Relation::GetQuery() {
 }
 
 string Relation::GetQuery(Binder &binder) {
+	if (type == RelationType::QUERY_RELATION) {
+		return GetQuery();
+	}
 	auto query_node = TryGetSerializableQueryNode(binder);
 	if (!query_node) {
 		return string();

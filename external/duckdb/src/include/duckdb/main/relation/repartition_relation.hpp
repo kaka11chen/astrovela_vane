@@ -39,14 +39,15 @@ public:
 	Relation *ChildRelation() override {
 		return child.get();
 	}
+
+protected:
 	bool ContainsNonSQLRelation() override {
 		return true;
 	}
 	bool CanBindAsInputInternal(Binder &binder) override {
-		return child->CanBindAsInputInternal(binder);
+		return ChildCanBindAsInput(*child, binder);
 	}
 
-protected:
 	BoundStatement BindAsInput(Binder &binder) override;
 };
 

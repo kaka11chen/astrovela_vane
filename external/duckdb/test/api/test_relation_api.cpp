@@ -1213,19 +1213,18 @@ TEST_CASE("Relation input binding is independent from SQL serialization", "[rela
 	REQUIRE(CHECK_COLUMN(result, 0, {2}));
 
 	auto direct_bound = distinct_join->Project("r.value AS x");
-	REQUIRE_FALSE(direct_bound->CanSerializeToQueryNode());
-	REQUIRE(direct_bound->CanBindAsInput());
+	REQUIRE(direct_bound->GetQuery().empty());
 	REQUIRE_THROWS_AS(direct_bound->GetTableRef(), NotImplementedException);
 	REQUIRE_NOTHROW(result = direct_bound->Filter("x > 100")->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {200}));
 
 	auto exchange = left->LocalExchange(2);
-	REQUIRE_FALSE(exchange->CanSerializeToQueryNode());
-	REQUIRE(exchange->CanBindAsInput());
+	REQUIRE(exchange->GetQuery().empty());
+	REQUIRE_NOTHROW(result = exchange->Execute());
 
 	auto explain = make_shared_ptr<ExplainRelation>(left);
-	REQUIRE_FALSE(explain->CanSerializeToQueryNode());
-	REQUIRE_FALSE(explain->CanBindAsInput());
+	REQUIRE(explain->GetQuery().empty());
+	REQUIRE_THROWS_AS(explain->GetTableRef(), NotImplementedException);
 
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE semi_left(left_id INTEGER, left_value VARCHAR)"));
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO semi_left VALUES (1, 'one'), (2, 'two'), (2, 'two')"));
@@ -1336,8 +1335,7 @@ TEST_CASE("Empty order is an identity and inherits child serializability", "[rel
 	auto values = con.Values("(42)");
 	duckdb::vector<OrderByNode> serializable_orders;
 	auto serializable_order = values->Order(std::move(serializable_orders));
-	REQUIRE(serializable_order->CanSerializeToQueryNode());
-	REQUIRE(serializable_order->CanBindAsInput());
+	REQUIRE_FALSE(serializable_order->GetQuery().empty());
 	REQUIRE_NOTHROW(result = serializable_order->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {42}));
 
@@ -1345,8 +1343,7 @@ TEST_CASE("Empty order is an identity and inherits child serializability", "[rel
 	duckdb::vector<OrderByNode> exchange_orders;
 	auto ordered = exchange->Order(std::move(exchange_orders));
 
-	REQUIRE_FALSE(ordered->CanSerializeToQueryNode());
-	REQUIRE(ordered->CanBindAsInput());
+	REQUIRE(ordered->GetQuery().empty());
 	REQUIRE_NOTHROW(result = ordered->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {42}));
 	REQUIRE_NOTHROW(result = ordered->Limit(1)->Execute());
@@ -1370,34 +1367,29 @@ TEST_CASE("Bound local query scopes determine relation serialization", "[relatio
 	auto boundary = left->Join(right, "l.join_key = r.join_key")->Distinct();
 
 	auto correlated = boundary->Project("(SELECT l.id) AS value");
-	REQUIRE_FALSE(correlated->CanSerializeToQueryNode());
 	REQUIRE(correlated->GetQuery().empty());
 	REQUIRE_NOTHROW(result = correlated->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {7}));
 
 	auto local = boundary->Project("(SELECT l.id FROM local_scope_source AS l) AS value");
-	REQUIRE(local->CanSerializeToQueryNode());
 	REQUIRE_FALSE(local->GetQuery().empty());
 	REQUIRE_NOTHROW(result = local->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {42}));
 
 	REQUIRE_NO_FAIL(con.Query("CREATE MACRO relation_field(value) AS value.id"));
 	auto macro_correlated = boundary->Project("relation_field(l) AS value");
-	REQUIRE_FALSE(macro_correlated->CanSerializeToQueryNode());
 	REQUIRE(macro_correlated->GetQuery().empty());
 	REQUIRE_NOTHROW(result = macro_correlated->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {7}));
 
 	auto using_boundary = left->Join(right, "join_key")->Distinct();
 	auto surviving_output = using_boundary->Project("(SELECT join_key) AS value");
-	REQUIRE(surviving_output->CanSerializeToQueryNode());
 	REQUIRE_FALSE(surviving_output->GetQuery().empty());
 	REQUIRE_NOTHROW(result = surviving_output->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {1}));
 
 	auto outer_boundary = left->Join(right, "join_key", JoinType::OUTER)->Distinct();
 	auto coalesced_output = outer_boundary->Project("(SELECT join_key) AS value");
-	REQUIRE(coalesced_output->CanSerializeToQueryNode());
 	REQUIRE_FALSE(coalesced_output->GetQuery().empty());
 	REQUIRE_NOTHROW(result = coalesced_output->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {1}));
@@ -1415,19 +1407,16 @@ TEST_CASE("Relation serialization follows current catalog bindings", "[relation_
 	                    ->Distinct()
 	                    ->Project("(SELECT r.right_value FROM local_scope_source AS r) AS value");
 
-	REQUIRE(relation->CanSerializeToQueryNode());
 	REQUIRE_FALSE(relation->GetQuery().empty());
 	REQUIRE_NOTHROW(result = relation->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {42}));
 
 	REQUIRE_NO_FAIL(con.Query("CREATE OR REPLACE VIEW local_scope_source AS SELECT 99 AS other"));
-	REQUIRE_FALSE(relation->CanSerializeToQueryNode());
 	REQUIRE(relation->GetQuery().empty());
 	REQUIRE_NOTHROW(result = relation->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {100}));
 
 	REQUIRE_NO_FAIL(con.Query("CREATE OR REPLACE VIEW local_scope_source AS SELECT 84 AS right_value"));
-	REQUIRE(relation->CanSerializeToQueryNode());
 	REQUIRE_FALSE(relation->GetQuery().empty());
 	REQUIRE_NOTHROW(result = relation->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {84}));
@@ -1479,13 +1468,12 @@ TEST_CASE("Struct fields preserve relation serialization boundaries", "[relation
 	auto boundary = left->Join(right, "l.id = r.id")->Distinct();
 
 	auto serialized = boundary->Project("payload.a.b.c.d AS value");
-	REQUIRE(serialized->CanSerializeToQueryNode());
+	REQUIRE_FALSE(serialized->GetQuery().empty());
 	REQUIRE_NOTHROW(result = serialized->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {7}));
 
 	auto direct_bound = boundary->Project("l.payload.a.b.c.d AS value");
-	REQUIRE_FALSE(direct_bound->CanSerializeToQueryNode());
-	REQUIRE(direct_bound->CanBindAsInput());
+	REQUIRE(direct_bound->GetQuery().empty());
 	REQUIRE_NOTHROW(result = direct_bound->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {7}));
 }
@@ -1500,12 +1488,11 @@ TEST_CASE("Virtual columns survive single-source relation boundaries", "[relatio
 	auto boundary = con.Table("virtual_source")->Distinct();
 
 	auto serialized = boundary->Project("virtual_source.value");
-	REQUIRE(serialized->CanSerializeToQueryNode());
+	REQUIRE_FALSE(serialized->GetQuery().empty());
 	REQUIRE_NOTHROW(result = serialized->Execute());
 
 	auto direct_bound = boundary->Project("virtual_source.rowid AS row_id")->Order("row_id");
-	REQUIRE_FALSE(direct_bound->CanSerializeToQueryNode());
-	REQUIRE(direct_bound->CanBindAsInput());
+	REQUIRE(direct_bound->GetQuery().empty());
 	REQUIRE_NOTHROW(result = direct_bound->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {0, 1}));
 }

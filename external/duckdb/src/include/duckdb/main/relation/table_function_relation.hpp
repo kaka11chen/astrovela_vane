@@ -47,23 +47,23 @@ public:
 	void AddNamedParameter(const string &name, Value argument);
 	void RemoveNamedParameterIfExists(const string &name);
 	void SetNamedParameters(named_parameter_map_t &&named_parameters);
-	const vector<string> &GetVirtualColumnNames() const {
-		return virtual_column_names;
-	}
-	bool ContainsNonSQLRelation() override {
-		return input_relation && input_relation->ContainsNonSQLRelation();
-	}
-	bool CanSerializeToQueryNodeInternal(Binder &binder) override {
-		return !input_relation || input_relation->CanSerializeToQueryNodeInternal(binder);
-	}
-	bool CanBindAsInputInternal(Binder &binder) override {
-		return !input_relation || input_relation->CanBindAsInputInternal(binder);
-	}
 
 protected:
+	bool ContainsNonSQLRelation() override {
+		return input_relation && ChildContainsNonSQLRelation(*input_relation);
+	}
+	bool CanSerializeToQueryNodeInternal(Binder &binder) override {
+		return !input_relation || ChildCanSerializeToQueryNode(*input_relation, binder);
+	}
+	bool CanBindAsInputInternal(Binder &binder) override {
+		return !input_relation || ChildCanBindAsInput(*input_relation, binder);
+	}
+
 	unique_ptr<TableRef> GetTableRefInternal() override;
 
 private:
+	friend class SerializedExpressionScopeChecker;
+
 	void InitializeColumns();
 	void CaptureVirtualColumnNames(const LogicalOperator &plan);
 	BoundStatement BindAsInput(Binder &binder) override;

@@ -158,7 +158,7 @@ BoundStatement OrderRelation::BindAsInput(Binder &binder) {
 }
 
 bool OrderRelation::CanSerializeToQueryNodeInternal(Binder &binder) {
-	if (!child->CanSerializeToQueryNodeInternal(binder)) {
+	if (!ChildCanSerializeToQueryNode(*child, binder)) {
 		return false;
 	}
 	if (orders.empty() || !child->InheritsColumnBindings() || RequiresSQLMultiSourceBinding(*child)) {

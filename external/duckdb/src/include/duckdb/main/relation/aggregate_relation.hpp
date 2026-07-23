@@ -40,12 +40,14 @@ public:
 	const vector<ColumnDefinition> &Columns() override;
 	string ToString(idx_t depth) override;
 	string GetAlias() override;
+
+protected:
 	bool ContainsNonSQLRelation() override {
-		return child->ContainsNonSQLRelation();
+		return ChildContainsNonSQLRelation(*child);
 	}
 	bool CanSerializeToQueryNodeInternal(Binder &binder) override;
 	bool CanBindAsInputInternal(Binder &binder) override {
-		return child->CanBindAsInputInternal(binder);
+		return ChildCanBindAsInput(*child, binder);
 	}
 };
 

@@ -53,10 +53,6 @@ string QueryRelation::GetQuery() {
 	return query;
 }
 
-string QueryRelation::GetQuery(Binder &) {
-	return query;
-}
-
 unique_ptr<TableRef> QueryRelation::GetTableRefInternal() {
 	auto subquery_ref = make_uniq<SubqueryRef>(GetSelectStatement(), GetAlias());
 	return std::move(subquery_ref);

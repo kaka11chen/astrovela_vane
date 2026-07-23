@@ -41,12 +41,13 @@ public:
 	Relation *ChildRelation() override {
 		return child.get();
 	}
-	bool CanSerializeToQueryNodeInternal(Binder &binder) override;
-	bool CanBindAsInputInternal(Binder &binder) override {
-		return child->CanBindAsInputInternal(binder);
-	}
 
 protected:
+	bool CanSerializeToQueryNodeInternal(Binder &binder) override;
+	bool CanBindAsInputInternal(Binder &binder) override {
+		return ChildCanBindAsInput(*child, binder);
+	}
+
 	BoundStatement BindAsInput(Binder &binder) override;
 };
 

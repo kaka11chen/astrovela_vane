@@ -37,8 +37,10 @@ public:
 	Relation *ChildRelation() override {
 		return child.get();
 	}
+
+protected:
 	bool CanBindAsInputInternal(Binder &binder) override {
-		return child->CanBindAsInputInternal(binder);
+		return ChildCanBindAsInput(*child, binder);
 	}
 };
 

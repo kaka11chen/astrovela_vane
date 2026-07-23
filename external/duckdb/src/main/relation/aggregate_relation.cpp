@@ -91,7 +91,7 @@ BoundStatement AggregateRelation::Bind(Binder &binder) {
 }
 
 bool AggregateRelation::CanSerializeToQueryNodeInternal(Binder &binder) {
-	if (!child->CanSerializeToQueryNodeInternal(binder)) {
+	if (!ChildCanSerializeToQueryNode(*child, binder)) {
 		return false;
 	}
 	if (!child->InheritsColumnBindings() || RequiresSQLMultiSourceBinding(*child)) {

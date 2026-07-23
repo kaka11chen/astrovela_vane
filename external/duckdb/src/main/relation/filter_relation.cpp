@@ -67,7 +67,7 @@ BoundStatement FilterRelation::BindAsInput(Binder &binder) {
 }
 
 bool FilterRelation::CanSerializeToQueryNodeInternal(Binder &binder) {
-	if (!child->CanSerializeToQueryNodeInternal(binder)) {
+	if (!ChildCanSerializeToQueryNode(*child, binder)) {
 		return false;
 	}
 	if (!child->InheritsColumnBindings() || RequiresSQLMultiSourceBinding(*child)) {

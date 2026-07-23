@@ -39,11 +39,12 @@ public:
 	Relation *ChildRelation() override {
 		return child.get();
 	}
-	bool CanBindAsInputInternal(Binder &binder) override {
-		return child->CanBindAsInputInternal(binder);
-	}
 
 protected:
+	bool CanBindAsInputInternal(Binder &binder) override {
+		return ChildCanBindAsInput(*child, binder);
+	}
+
 	BoundStatement BindAsInput(Binder &binder) override;
 };
 

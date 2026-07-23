@@ -27,7 +27,7 @@ CreateViewRelation::CreateViewRelation(shared_ptr<Relation> child_p, string sche
 }
 
 BoundStatement CreateViewRelation::Bind(Binder &binder) {
-	auto query_node = child->TryGetSerializableQueryNode(binder);
+	auto query_node = TryGetSerializableChildQueryNode(*child, binder);
 	if (!query_node) {
 		throw NotImplementedException(
 		    "Cannot create a view from a relation that cannot be faithfully represented as a "

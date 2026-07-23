@@ -26,7 +26,7 @@ InsertRelation::InsertRelation(shared_ptr<Relation> child_p, string catalog_name
 }
 
 BoundStatement InsertRelation::Bind(Binder &binder) {
-	auto query_node = child->TryGetSerializableQueryNode(binder);
+	auto query_node = TryGetSerializableChildQueryNode(*child, binder);
 	if (!query_node) {
 		throw NotImplementedException("Cannot insert from a relation that cannot be faithfully represented as a SQL "
 		                              "query node; conversion would discard the exchange or lose relation bindings");
