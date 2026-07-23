@@ -25,6 +25,7 @@ _FAULT_RAY_RUNTIME_OWNED = False
 
 import duckdb.runners.ray.worker_handle as worker_handle_mod
 from duckdb.runners.ray import worker as worker_mod
+from duckdb.runners.ray.fte_fragment_scheduler import ensure_fte_fragment_progress_topology
 from duckdb.runners.ray.query_execution_graph import (
     NodeResourceAllocation,
     QueryAllocation,
@@ -47,6 +48,26 @@ class RayWorkerActorHandle(_ProductionRayWorkerActorHandle):
             memory_capacity_bytes=memory_capacity_bytes,
             worker_id=worker_id,
             node_id=str(node_id or ray.get_runtime_context().get_node_id()),
+        )
+
+
+class _ControlFaultRayWorkerActorHandle(RayWorkerActorHandle):
+    def _ensure_fragment_progress_topology(self, query_id, fragment_id, fragment_plan):
+        topology = {
+            "schema": "pipeline_topology",
+            "pipelines": [
+                {
+                    "pipeline_id": 1,
+                    "operators": ["TABLE_SCAN"],
+                    "operator_details": [{}],
+                    "stage_ids": [],
+                }
+            ],
+        }
+        return ensure_fte_fragment_progress_topology(
+            query_id,
+            fragment_id,
+            lambda: topology,
         )
 
 
@@ -166,7 +187,15 @@ class _RayFteTask:
         return "scan-task"
 
     def context(self):
-        return {"query_id": "query-real-kill", "node_id": "7"}
+        query_id = "query-real-kill"
+        node_id = "7"
+        fragment_id = f"{query_id}:node:{node_id}"
+        return {
+            "query_id": query_id,
+            "node_id": node_id,
+            "resource_query_id": query_id,
+            "resource_stage_id": fte_stage_id_for_fragment(query_id, fragment_id),
+        }
 
     def task_context(self):
         return {"query_idx": 0, "last_node_id": 7, "task_id": 0, "node_ids": [7]}
@@ -204,7 +233,13 @@ class _NativeDynamicScanTask:
         return self._name
 
     def context(self):
-        return {"query_id": self.query_id, "node_id": self.fragment_node_id}
+        fragment_id = f"{self.query_id}:node:{self.fragment_node_id}"
+        return {
+            "query_id": self.query_id,
+            "node_id": self.fragment_node_id,
+            "resource_query_id": self.query_id,
+            "resource_stage_id": fte_stage_id_for_fragment(self.query_id, fragment_id),
+        }
 
     def task_context(self):
         try:
@@ -296,8 +331,8 @@ def _register_fault_query(tasks) -> None:
 def _init_ray_for_fault_test(monkeypatch) -> None:
     global _FAULT_RAY_RUNTIME_OWNED
 
-    test_dir = str(Path(__file__).resolve().parent)
-    pythonpath_entries = [test_dir]
+    test_file = Path(__file__).resolve()
+    pythonpath_entries = [str(test_file.parent), str(test_file.parents[1])]
     try:
         import _duckdb as duckdb_ext
 
@@ -438,8 +473,8 @@ def test_real_ray_actor_kill_replays_fte_task_on_replacement(monkeypatch):
     _register_fault_query([task])
     actor0 = _FteControlFaultActor.remote(finish_attempts=False)
     actor1 = _FteControlFaultActor.remote(finish_attempts=True)
-    handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-a")
-    RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-b")
+    handle0 = _ControlFaultRayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-a")
+    _ControlFaultRayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-b")
 
     try:
         task_handle = handle0.submit_tasks([task])[0]
@@ -490,7 +525,7 @@ def test_real_ray_actor_kill_without_replacement_fails_fte_stage(monkeypatch):
     task = _RayFteTask()
     _register_fault_query([task])
     actor0 = _FteControlFaultActor.remote(finish_attempts=False)
-    handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-solo")
+    handle0 = _ControlFaultRayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-solo")
 
     try:
         task_handle = handle0.submit_tasks([task])[0]
