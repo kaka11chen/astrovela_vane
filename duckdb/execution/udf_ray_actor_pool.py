@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -125,7 +126,7 @@ class UDFActorPoolBase:
         self._confirmed_ready: set[int] = set()
 
     @staticmethod
-    def _actor_class(max_restarts: int, max_task_retries: int):
+    def _actor_class(max_restarts: int, max_task_retries: int) -> Any:
         raise NotImplementedError
 
     @staticmethod
@@ -172,7 +173,7 @@ class UDFActorPoolBase:
         if invalid:
             raise ValueError(f"actor_dispatch_indices contains out-of-range indices: {invalid}")
         instance._confirmed_ready = set(parsed_dispatch_indices)
-        instance._payload = payload
+        instance._payload = payload or {}
         instance._payload_ref = None
         instance._init_refs = []
         instance.actor_node_ids = cls._normalize_actor_node_ids(actor_node_ids, expected_count=len(actors))
@@ -212,8 +213,8 @@ def _positive_float_env(name: str, default: float | None = None) -> float | None
     if not raw:
         return default
     value = float(raw)
-    if value < 0.0:
-        raise ValueError(f"{name} must be non-negative")
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be finite and positive")
     return value
 
 

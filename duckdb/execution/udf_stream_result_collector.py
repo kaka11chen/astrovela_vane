@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import sys
 import threading
@@ -110,11 +111,15 @@ class AsyncResultCollector:
 
     def __init__(self, *, ray_module: Any | None = None) -> None:
         if ray_module is None:
-            import ray as ray_module
+            import ray as imported_ray
 
-        self._ray = ray_module
+            active_ray_module = imported_ray
+        else:
+            active_ray_module = ray_module
+
+        self._ray = active_ray_module
         self._shutdown_timeout_s = float(os.environ.get("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S", "5"))
-        if self._shutdown_timeout_s <= 0:
+        if not math.isfinite(self._shutdown_timeout_s) or self._shutdown_timeout_s <= 0:
             raise ValueError("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S must be positive")
         self._cv = threading.Condition()
         self._shutdown = False
@@ -522,6 +527,8 @@ class AsyncResultCollector:
                 or record.completion_future is not future
             ):
                 return
+            if future is None:
+                return
         try:
             future.result()
             record.producer_completed = True
@@ -552,6 +559,8 @@ class AsyncResultCollector:
                 or record.terminal
                 or record.wait_future is not future
             ):
+                return
+            if future is None:
                 return
         try:
             value = future.result()
