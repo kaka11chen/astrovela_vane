@@ -3212,7 +3212,19 @@ def test_fte_worker_capacity_registers_every_ready_partition_with_credit_authori
     assert len([call for call in actor.fte_calls if call[0] == "create"]) == 2
 
 
-def test_fte_pending_drain_is_fair_across_queries(monkeypatch):
+@pytest.mark.parametrize(
+    ("terminal_state", "terminal_extra", "next_query_a_attempt"),
+    [
+        ("FINISHED", {}, "query-a.0.1.0"),
+        ("FAILED", {"failure": {"message": "retry me"}}, "query-a.0.0.1"),
+    ],
+)
+def test_fte_pending_drain_is_fair_across_queries(
+    monkeypatch,
+    terminal_state,
+    terminal_extra,
+    next_query_a_attempt,
+):
     monkeypatch.setattr(
         RayWorkerActorHandle,
         "_fte_task_handle_cls",
@@ -3230,13 +3242,21 @@ def test_fte_pending_drain_is_fair_across_queries(monkeypatch):
         [
             _FakeTask(
                 name="query-a-task-0",
-                context={"query_id": "query-a", "node_id": "8"},
+                context={
+                    "query_id": "query-a",
+                    "node_id": "8",
+                    "task_execution_class": "STANDARD",
+                },
                 inputs={"3": {"kind": "exchange_source_task", "data": b"p0"}},
                 plan={"plan": "exchange-template"},
             ),
             _FakeTask(
                 name="query-a-task-1",
-                context={"query_id": "query-a", "node_id": "8"},
+                context={
+                    "query_id": "query-a",
+                    "node_id": "8",
+                    "task_execution_class": "STANDARD",
+                },
                 inputs={"3": {"kind": "exchange_source_task", "data": b"p1"}},
                 plan={"plan": "exchange-template"},
             ),
@@ -3246,7 +3266,11 @@ def test_fte_pending_drain_is_fair_across_queries(monkeypatch):
         [
             _FakeTask(
                 name="query-b-task-0",
-                context={"query_id": "query-b", "node_id": "8"},
+                context={
+                    "query_id": "query-b",
+                    "node_id": "8",
+                    "task_execution_class": "STANDARD",
+                },
                 inputs={"3": {"kind": "exchange_source_task", "data": b"p0"}},
                 plan={"plan": "exchange-template"},
             )
@@ -3261,9 +3285,10 @@ def test_fte_pending_drain_is_fair_across_queries(monkeypatch):
 
     completion_handles = handle.handle_fte_task_status(
         {
-            "state": "FINISHED",
+            "state": terminal_state,
             "task_id": query_a_handles[0].task_id.to_dict(),
             "version": 1,
+            **terminal_extra,
         }
     )
     first_scheduled = handle.pop_fte_result_handles("query-b")
@@ -3272,7 +3297,7 @@ def test_fte_pending_drain_is_fair_across_queries(monkeypatch):
     assert [str(task_handle.task_id) for task_handle in first_scheduled] == ["query-b.0.0.0"]
     handle.record_fte_task_terminal(first_scheduled[0].task_id)
     second_scheduled = handle.pop_fte_result_handles("query-a")
-    assert [str(task_handle.task_id) for task_handle in second_scheduled] == ["query-a.0.1.0"]
+    assert [str(task_handle.task_id) for task_handle in second_scheduled] == [next_query_a_attempt]
 
 
 def test_fte_pending_drain_prefers_standard_over_speculative(monkeypatch):
@@ -4196,15 +4221,15 @@ def test_fte_worker_failure_replays_all_owned_stage_partitions(monkeypatch):
     assert actor1.register_payloads == [
         [
             {
-                "fragment_id": "query-host-loss:node:scan",
-                "plan": {"plan": "scan-template"},
+                "fragment_id": "query-host-loss:node:exchange",
+                "plan": {"plan": "exchange-template"},
                 "query_id": "query-host-loss",
             }
         ],
         [
             {
-                "fragment_id": "query-host-loss:node:exchange",
-                "plan": {"plan": "exchange-template"},
+                "fragment_id": "query-host-loss:node:scan",
+                "plan": {"plan": "scan-template"},
                 "query_id": "query-host-loss",
             }
         ],
@@ -5581,7 +5606,8 @@ def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
         def __init__(self):
             self.statuses = []
 
-        def handle_task_status(self, status):
+        def handle_task_status(self, status, *, schedule_retry=True):
+            del schedule_retry
             self.statuses.append(dict(status))
             return None
 
@@ -5812,7 +5838,8 @@ def test_fte_registry_close_waits_for_terminal_handler_and_suppresses_retry(monk
             }
 
     class _BlockedFragmentExecution:
-        def handle_task_status(self, _status):
+        def handle_task_status(self, _status, *, schedule_retry=True):
+            del schedule_retry
             handler_entered.set()
             assert release_handler.wait(2.0)
             return object()
@@ -5872,6 +5899,74 @@ def test_fte_registry_close_waits_for_terminal_handler_and_suppresses_retry(monk
     assert watcher.is_alive() is False
     assert retry_attempts == []
     assert outbox_executions == []
+
+
+def test_fte_terminal_close_race_still_drains_other_queries(monkeypatch):
+    monkeypatch.setattr(
+        fragment_submission_mod,
+        "_split_exchange_source_task_by_partition",
+        lambda value: ([(int(value[-1:]), value)], 2, 2, False),
+    )
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=15, worker_id="worker-0")
+
+    def task(query_id):
+        return _FakeTask(
+            name=f"{query_id}-task-0",
+            context={"query_id": query_id, "node_id": "8"},
+            inputs={"3": {"kind": "exchange_source_task", "data": b"p0"}},
+            plan={"plan": "exchange-template"},
+        )
+
+    query_a_handles = handle.submit_tasks([task("query-a")])
+    query_b_handles = handle.submit_tasks([task("query-b")])
+
+    assert [str(task_handle.task_id) for task_handle in query_a_handles] == ["query-a.0.0.0"]
+    assert query_b_handles == []
+    assert [str(task_handle.task_id) for task_handle in handle.pop_fte_result_handles("query-a")] == ["query-a.0.0.0"]
+
+    fragment_execution = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[("query-a", "query-a:node:8")]
+    original_handle_task_status = fragment_execution.handle_task_status
+    mutation_done = threading.Event()
+    release_handler = threading.Event()
+
+    def blocked_handle_task_status(status, *, schedule_retry=True):
+        result = original_handle_task_status(status, schedule_retry=schedule_retry)
+        mutation_done.set()
+        assert release_handler.wait(2.0)
+        return result
+
+    monkeypatch.setattr(fragment_execution, "handle_task_status", blocked_handle_task_status)
+    completion_handles = []
+    completion_errors = []
+
+    def finish_query_a():
+        try:
+            completion_handles.extend(
+                handle.handle_fte_task_status(
+                    {
+                        "state": "FINISHED",
+                        "task_id": query_a_handles[0].task_id.to_dict(),
+                        "version": 1,
+                    }
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            completion_errors.append(exc)
+
+    completion_thread = threading.Thread(target=finish_query_a)
+    completion_thread.start()
+    assert mutation_done.wait(1.0)
+
+    worker_handle_mod.close_fte_registry_for_query("query-a")
+    release_handler.set()
+    completion_thread.join(2.0)
+
+    assert completion_thread.is_alive() is False
+    assert completion_errors == []
+    assert [str(task_handle.task_id) for task_handle in completion_handles] == ["query-b.0.0.0"]
+    scheduled_query_b = handle.pop_fte_result_handles("query-b")
+    assert [str(task_handle.task_id) for task_handle in scheduled_query_b] == ["query-b.0.0.0"]
 
 
 def test_fte_registry_close_fences_inflight_remote_mutation_ownership():

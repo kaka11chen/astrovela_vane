@@ -1005,6 +1005,7 @@ class FteFragmentExecution:
         error: Any = None,
         *,
         retryable: bool = True,
+        schedule_retry: bool = True,
     ) -> ScheduledAttempt | None:
         attempt = FteTaskAttemptId.coerce(attempt_id)
         should_schedule = False
@@ -1034,7 +1035,7 @@ class FteFragmentExecution:
 
         if running is not None:
             self._record_task_terminal_without_drain(running.remote_handle, attempt)
-        if not should_schedule:
+        if not should_schedule or not schedule_retry:
             return None
         return self._schedule_partition_if_ready(attempt.partition_id)
 
@@ -1099,6 +1100,7 @@ class FteFragmentExecution:
         *,
         retryable: bool = True,
         retryable_by_partition_id: Mapping[int, bool] | None = None,
+        schedule_retries: bool = True,
     ) -> list[ScheduledAttempt]:
         worker_id = str(worker_id)
         with self._state_lock:
@@ -1113,7 +1115,12 @@ class FteFragmentExecution:
             partition_retryable = retryable
             if retryable_by_partition_id is not None:
                 partition_retryable = retryable and bool(retryable_by_partition_id.get(partition_id, False))
-            retry = self.task_failed(attempt, error, retryable=partition_retryable)
+            retry = self.task_failed(
+                attempt,
+                error,
+                retryable=partition_retryable,
+                schedule_retry=schedule_retries,
+            )
             if retry is not None:
                 scheduled.append(retry)
         return scheduled
@@ -1170,6 +1177,7 @@ class FteFragmentExecution:
         status: Mapping[str, Any],
         *,
         retryable: bool = True,
+        schedule_retry: bool = True,
     ) -> ScheduledAttempt | None:
         if str(status.get("state", "")).upper() == "UNKNOWN":
             return None
@@ -1192,6 +1200,7 @@ class FteFragmentExecution:
                     attempt_id,
                     _missing_output_stats_failure(attempt_id),
                     retryable=retryable,
+                    schedule_retry=schedule_retry,
                 )
             self.task_finished(attempt_id, output_stats)
             return None
@@ -1201,6 +1210,7 @@ class FteFragmentExecution:
                 attempt_id,
                 status.get("failure") or dict(status),
                 retryable=status_retryable,
+                schedule_retry=schedule_retry,
             )
         return None
 

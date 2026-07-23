@@ -172,7 +172,12 @@ class FteWorkerEventHandlingMixin:
         if fragment_execution is None:
             return []
         try:
-            scheduled = fragment_execution.handle_task_status(event.status)
+            scheduled = fragment_execution.handle_task_status(
+                event.status,
+                schedule_retry=False,
+            )
+            if terminal:
+                self._enqueue_fte_global_pending_drain(query_id)
             with _FTE_REGISTRY_LOCK:
                 if query_id in _FTE_CLOSING_QUERIES:
                     return []
@@ -189,8 +194,6 @@ class FteWorkerEventHandlingMixin:
                 [scheduled],
             )
         )
-        if terminal:
-            self._enqueue_fte_global_pending_drain(query_id)
         return handles
 
     def _handles_for_exchange_selector_updated_event(self, event: ExchangeSelectorUpdated) -> list[Any]:

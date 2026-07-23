@@ -2246,6 +2246,7 @@ def _mark_fte_worker_failed(
                 error or f"FTE worker lost: {failed_worker_id}",
                 retryable=True,
                 retryable_by_partition_id=retryable_by_partition_id,
+                schedule_retries=False,
             )
             if scheduled:
                 scheduled_by_stage.append((query_id, fragment_id, scheduled, []))
