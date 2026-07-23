@@ -122,18 +122,20 @@ class FteWorkerEventHandlingMixin:
         except Exception as exc:
             remove_pending_fte_worker_reservation_if_current(key, future)
             raise RuntimeError(f"FTE worker reservation failed: {exc}") from exc
-        partition = fragment_execution.partitions.get(int(event.partition_id))
-        if partition is None or partition.running_attempt is not None or partition.finished or partition.failed:
-            remove_pending_fte_worker_reservation_if_current(key, future)
-            FteWorkerPlacementManager.release_owner(
-                query_id=key[0],
-                fragment_id=key[1],
-                partition_id=key[2],
-            )
-            return []
-        remove_pending_fte_worker_reservation_if_current(key, future)
         try:
-            scheduled = fragment_execution.start_attempt_with_worker(partition)
+            with fragment_execution._attempt_scheduling_lock:
+                partition = fragment_execution.partitions.get(int(event.partition_id))
+                if partition is None or partition.running_attempt is not None or partition.finished or partition.failed:
+                    if remove_pending_fte_worker_reservation_if_current(key, future):
+                        FteWorkerPlacementManager.release_owner(
+                            query_id=key[0],
+                            fragment_id=key[1],
+                            partition_id=key[2],
+                        )
+                    return []
+                if not remove_pending_fte_worker_reservation_if_current(key, future):
+                    return []
+                scheduled = fragment_execution.start_attempt_with_worker(partition)
             self._execute_fte_fragment_execution_outbox(fragment_execution)
         except FteWorkerControlFailure as exc:
             return self._handles_for_fte_worker_control_failure(exc)

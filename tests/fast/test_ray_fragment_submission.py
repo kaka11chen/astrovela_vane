@@ -4,6 +4,7 @@
 import asyncio
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -2805,6 +2806,63 @@ def test_fte_stale_worker_reservation_generation_does_not_consume_new_future(mon
     assert scheduled[0].worker_handle is replacement
     assert pending_key not in worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS
     assert [call[1]["task_id"]["partition_id"] for call in actor1.fte_calls if call[0] == "create"] == [1]
+
+
+def test_fte_worker_reservation_completion_is_atomic_with_pending_drain(monkeypatch):
+    from duckdb.runners.ray import fragment_worker_events as worker_events_mod
+
+    query_id = "query-reservation-completion-race"
+    actor, handle, pending_key, pending_future = _submit_strict_worker_reservation_pending_pair(
+        monkeypatch,
+        query_id,
+    )
+    running = handle.pop_fte_result_handles(query_id)
+    assert len(running) == 1
+
+    first_reservation_removed = threading.Event()
+    allow_first_attempt_start = threading.Event()
+    pending_drain_entered = threading.Event()
+    remove_generations = []
+    original_remove = worker_events_mod.remove_pending_fte_worker_reservation_if_current
+
+    def blocked_remove(key, future):
+        removed = original_remove(key, future)
+        if removed:
+            remove_generations.append(future.reservation_generation)
+        if removed and len(remove_generations) == 1:
+            first_reservation_removed.set()
+            assert allow_first_attempt_start.wait(5.0)
+        return removed
+
+    monkeypatch.setattr(
+        worker_events_mod,
+        "remove_pending_fte_worker_reservation_if_current",
+        blocked_remove,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        completion = executor.submit(handle.record_fte_task_terminal, running[0].task_id)
+        assert first_reservation_removed.wait(5.0)
+
+        fragment_execution = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[(query_id, pending_key[1])]
+        original_schedule_next = fragment_execution.schedule_next_pending_partition
+
+        def observed_schedule_next(*args, **kwargs):
+            pending_drain_entered.set()
+            return original_schedule_next(*args, **kwargs)
+
+        monkeypatch.setattr(fragment_execution, "schedule_next_pending_partition", observed_schedule_next)
+        drain = executor.submit(handle._drain_fte_pending_tasks)
+        assert pending_drain_entered.wait(5.0)
+        allow_first_attempt_start.set()
+        completion.result(timeout=5.0)
+        drain.result(timeout=5.0)
+
+    assert remove_generations == [pending_future.reservation_generation]
+    assert fragment_execution.partitions[1].running_attempt is not None
+    assert worker_handle_mod._FTE_PARTITION_OWNERS[pending_key] is handle
+    assert pending_key in worker_handle_mod._FTE_PARTITION_TASK_LEASES
+    assert pending_key not in worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS
+    assert [call[1]["task_id"]["partition_id"] for call in actor.fte_calls if call[0] == "create"] == [0, 1]
 
 
 def test_fte_pending_worker_reservation_cancelled_on_query_drop(monkeypatch):
