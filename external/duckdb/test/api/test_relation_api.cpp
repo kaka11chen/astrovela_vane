@@ -1478,21 +1478,34 @@ TEST_CASE("Struct fields preserve relation serialization boundaries", "[relation
 	REQUIRE(CHECK_COLUMN(result, 0, {7}));
 }
 
-TEST_CASE("Virtual columns survive single-source relation boundaries", "[relation_api]") {
+TEST_CASE("Distinct removes virtual columns from inherited relation bindings", "[relation_api]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 	duckdb::unique_ptr<QueryResult> result;
 
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE virtual_source(value INTEGER)"));
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO virtual_source VALUES (10), (20)"));
+	auto filtered = con.Table("virtual_source")->Filter("value > 0");
+	auto filtered_rowid = filtered->Project("virtual_source.rowid AS row_id")->Order("row_id");
+	REQUIRE_NOTHROW(result = filtered_rowid->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {0, 1}));
+
 	auto boundary = con.Table("virtual_source")->Distinct();
 
 	auto serialized = boundary->Project("virtual_source.value");
 	REQUIRE_FALSE(serialized->GetQuery().empty());
 	REQUIRE_NOTHROW(result = serialized->Execute());
 
-	auto direct_bound = boundary->Project("virtual_source.rowid AS row_id")->Order("row_id");
-	REQUIRE(direct_bound->GetQuery().empty());
-	REQUIRE_NOTHROW(result = direct_bound->Execute());
-	REQUIRE(CHECK_COLUMN(result, 0, {0, 1}));
+	REQUIRE_THROWS(boundary->Project("virtual_source.rowid AS row_id"));
+
+	auto rowid_filtered_boundary = con.Table("virtual_source")->Filter("rowid >= 0")->Distinct();
+	REQUIRE_NOTHROW(result = rowid_filtered_boundary->Project("value")->Order("value")->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {10, 20}));
+	REQUIRE_THROWS(rowid_filtered_boundary->Project("rowid"));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE named_rowid(rowid INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO named_rowid VALUES (10), (20)"));
+	auto named_rowid = con.Table("named_rowid")->Distinct()->Project("rowid")->Order("rowid");
+	REQUIRE_NOTHROW(result = named_rowid->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {10, 20}));
 }

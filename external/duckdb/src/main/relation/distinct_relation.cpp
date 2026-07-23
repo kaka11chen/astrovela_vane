@@ -62,6 +62,9 @@ BoundStatement DistinctRelation::BindAsInput(Binder &binder) {
 	auto distinct = make_uniq<LogicalDistinct>(std::move(targets), DistinctType::DISTINCT);
 	distinct->AddChild(std::move(child_bound.plan));
 	child_bound.plan = std::move(distinct);
+	// DISTINCT only emits its visible targets. Hidden virtual columns such as
+	// rowid no longer identify a unique output row and must not bind downstream.
+	binder.bind_context.RemoveVirtualColumnBindings();
 	return child_bound;
 }
 

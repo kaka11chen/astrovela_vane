@@ -96,6 +96,10 @@ public:
 
 	void GetTypesAndNames(vector<string> &result_names, vector<LogicalType> &result_types);
 
+	//! Remove hidden virtual columns from name resolution after an operator that
+	//! only emits the visible columns.
+	void RemoveVirtualColumnBindings();
+
 	//! Adds a base table with the given alias to the BindContext.
 	void AddBaseTable(idx_t index, const string &alias, const vector<string> &names, const vector<LogicalType> &types,
 	                  vector<ColumnIndex> &bound_column_ids, TableCatalogEntry &entry, bool add_row_id = true);

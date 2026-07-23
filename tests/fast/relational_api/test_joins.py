@@ -648,15 +648,42 @@ class TestRAPIJoins:
             con.sql("SELECT * FROM result")
 
     @pytest.mark.parametrize("expression", ["rowid_source.rowid AS row_id", "rowid AS row_id"])
-    @pytest.mark.parametrize("boundary", ["distinct", "limit", "order"])
+    @pytest.mark.parametrize("boundary", ["limit", "order"])
     def test_virtual_rowid_after_join_boundary_is_not_serialized(self, con, boundary, expression):
         con.execute("CREATE TABLE rowid_source(value INTEGER)")
         con.execute("INSERT INTO rowid_source VALUES (10), (20)")
         left = con.table("rowid_source")
         right = con.sql("SELECT 1 AS join_key").set_alias("r")
         relation = left.cross(right)
-        if boundary == "distinct":
-            relation = relation.distinct()
+        if boundary == "limit":
+            relation = relation.limit(2)
+        else:
+            relation = relation.order("rowid_source.value")
+        result = relation.project(expression)
+
+        assert sorted(result.fetchall()) == [(0,), (1,)]
+        assert result.sql_query() == ""
+        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+            con.sql("SELECT * FROM result")
+
+    @pytest.mark.parametrize("expression", ["rowid_source.rowid AS row_id", "rowid AS row_id"])
+    def test_virtual_rowid_after_distinct_join_boundary_is_rejected(self, con, expression):
+        con.execute("CREATE TABLE rowid_source(value INTEGER)")
+        con.execute("INSERT INTO rowid_source VALUES (10), (20)")
+        left = con.table("rowid_source")
+        right = con.sql("SELECT 1 AS join_key").set_alias("r")
+
+        with pytest.raises(duckdb.BinderException, match="rowid"):
+            left.cross(right).distinct().project(expression)
+
+    @pytest.mark.parametrize("expression", ["rowid_source.rowid AS row_id", "rowid AS row_id"])
+    @pytest.mark.parametrize("boundary", ["filter", "limit", "order"])
+    def test_virtual_rowid_after_single_source_boundary_is_not_serialized(self, con, boundary, expression):
+        con.execute("CREATE TABLE rowid_source(value INTEGER)")
+        con.execute("INSERT INTO rowid_source VALUES (10), (20)")
+        relation = con.table("rowid_source")
+        if boundary == "filter":
+            relation = relation.filter("value > 0")
         elif boundary == "limit":
             relation = relation.limit(2)
         else:
@@ -669,52 +696,32 @@ class TestRAPIJoins:
             con.sql("SELECT * FROM result")
 
     @pytest.mark.parametrize("expression", ["rowid_source.rowid AS row_id", "rowid AS row_id"])
-    @pytest.mark.parametrize("boundary", ["filter", "distinct", "limit", "order"])
-    def test_virtual_rowid_after_single_source_boundary_is_not_serialized(self, con, boundary, expression):
+    def test_virtual_rowid_after_single_source_distinct_is_rejected(self, con, expression):
         con.execute("CREATE TABLE rowid_source(value INTEGER)")
         con.execute("INSERT INTO rowid_source VALUES (10), (20)")
-        relation = con.table("rowid_source")
-        if boundary == "filter":
-            relation = relation.filter("value > 0")
-        elif boundary == "distinct":
-            relation = relation.distinct()
-        elif boundary == "limit":
-            relation = relation.limit(2)
-        else:
-            relation = relation.order("rowid_source.value")
-        result = relation.project(expression)
 
-        assert sorted(result.fetchall()) == [(0,), (1,)]
-        assert result.sql_query() == ""
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
-            con.sql("SELECT * FROM result")
+        with pytest.raises(duckdb.BinderException, match="rowid"):
+            con.table("rowid_source").distinct().project(expression)
 
     @pytest.mark.parametrize(
-        ("expression", "expected"),
+        "expression",
         [
-            ("read_parquet.filename AS value", None),
-            ("filename AS value", None),
-            ("read_parquet.file_index AS value", [(0,)]),
-            ("file_index AS value", [(0,)]),
-            ("read_parquet.file_row_number AS value", [(0,)]),
-            ("file_row_number AS value", [(0,)]),
+            "read_parquet.filename AS value",
+            "filename AS value",
+            "read_parquet.file_index AS value",
+            "file_index AS value",
+            "read_parquet.file_row_number AS value",
+            "file_row_number AS value",
         ],
     )
-    def test_table_function_virtual_column_after_join_boundary_is_not_serialized(
-        self, con, tmp_path, expression, expected
-    ):
+    def test_table_function_virtual_column_after_distinct_join_boundary_is_rejected(self, con, tmp_path, expression):
         parquet_path = tmp_path / "virtual_columns.parquet"
         con.execute(f"COPY (SELECT 1 AS id) TO '{parquet_path}' (FORMAT PARQUET)")
         left = con.table_function("read_parquet", [str(parquet_path)])
         right = con.sql("SELECT 1 AS join_key").set_alias("r")
-        result = left.cross(right).distinct().project(expression)
-        if expected is None:
-            expected = [(str(parquet_path),)]
 
-        assert result.fetchall() == expected
-        assert result.sql_query() == ""
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
-            con.sql("SELECT * FROM result")
+        with pytest.raises(duckdb.BinderException):
+            left.cross(right).distinct().project(expression)
 
     @pytest.mark.parametrize(
         ("expression", "expected"),
@@ -727,7 +734,7 @@ class TestRAPIJoins:
             ("file_row_number AS value", [(0,)]),
         ],
     )
-    @pytest.mark.parametrize("boundary", ["filter", "distinct", "limit", "order"])
+    @pytest.mark.parametrize("boundary", ["filter", "limit", "order"])
     def test_table_function_virtual_column_after_single_source_boundary_is_not_serialized(
         self, con, tmp_path, expression, expected, boundary
     ):
@@ -736,8 +743,6 @@ class TestRAPIJoins:
         relation = con.table_function("read_parquet", [str(parquet_path)])
         if boundary == "filter":
             relation = relation.filter("id > 0")
-        elif boundary == "distinct":
-            relation = relation.distinct()
         elif boundary == "limit":
             relation = relation.limit(1)
         else:
@@ -750,6 +755,25 @@ class TestRAPIJoins:
         assert result.sql_query() == ""
         with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM result")
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "read_parquet.filename AS value",
+            "filename AS value",
+            "read_parquet.file_index AS value",
+            "file_index AS value",
+            "read_parquet.file_row_number AS value",
+            "file_row_number AS value",
+        ],
+    )
+    def test_table_function_virtual_column_after_single_source_distinct_is_rejected(self, con, tmp_path, expression):
+        parquet_path = tmp_path / "single_source_distinct_virtual_columns.parquet"
+        con.execute(f"COPY (SELECT 1 AS id) TO '{parquet_path}' (FORMAT PARQUET)")
+        relation = con.table_function("read_parquet", [str(parquet_path)])
+
+        with pytest.raises(duckdb.BinderException):
+            relation.distinct().project(expression)
 
     @pytest.mark.parametrize("boundary", ["distinct", "limit", "order"])
     def test_join_boundary_survives_uncorrelated_subquery(self, con, boundary):

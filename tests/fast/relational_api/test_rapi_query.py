@@ -61,6 +61,14 @@ class TestRAPIQuery:
         assert duplicate_names.columns == ["x", "x"]
         assert duckdb_cursor.sql(duplicate_names_sql).columns == ["x", "x"]
 
+    def test_distinct_above_order_requires_a_final_order_for_deterministic_results(self, duckdb_cursor):
+        values = duckdb_cursor.sql("SELECT * FROM (VALUES (1), (1), (2)) data(id)")
+        ordered_distinct = values.order("id DESC").distinct()
+
+        plan = ordered_distinct.explain()
+        assert plan.index("HASH_GROUP_BY") < plan.index("ORDER_BY")
+        assert ordered_distinct.order("id").fetchall() == [(1,), (2,)]
+
     @pytest.mark.parametrize(
         ("operation", "expected"),
         [

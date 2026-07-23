@@ -635,6 +635,14 @@ void BindContext::GetTypesAndNames(vector<string> &result_names, vector<LogicalT
 	}
 }
 
+void BindContext::RemoveVirtualColumnBindings() {
+	for (auto &binding : bindings_list) {
+		if (binding->GetBindingType() == BindingType::TABLE) {
+			binding->Cast<TableBinding>().RemoveVirtualColumnBindings();
+		}
+	}
+}
+
 void BindContext::AddBinding(unique_ptr<Binding> binding) {
 	bindings_list.push_back(std::move(binding));
 }
