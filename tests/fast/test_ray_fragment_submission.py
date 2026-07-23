@@ -2723,6 +2723,18 @@ def _completed_test_reservation(future, worker):
     )
 
 
+class _BlockingStringError(RuntimeError):
+    def __init__(self, message, entered, release):
+        super().__init__(message)
+        self._entered = entered
+        self._release = release
+
+    def __str__(self):
+        self._entered.set()
+        assert self._release.wait(5.0)
+        return super().__str__()
+
+
 def test_fte_completed_worker_reservation_reselects_when_event_worker_failed(monkeypatch):
     query_id = "query-reservation-worker-failed"
     actor0, failed, pending_key, pending_future = _submit_strict_worker_reservation_pending_pair(
@@ -2863,7 +2875,8 @@ def test_fte_worker_reservation_completion_is_atomic_with_pending_drain(monkeypa
 
     first_reservation_removed = threading.Event()
     allow_first_attempt_start = threading.Event()
-    pending_drain_entered = threading.Event()
+    pending_drain_started = threading.Event()
+    command_handoff_lock_owned = []
     remove_generations = []
     original_remove = worker_events_mod.remove_pending_fte_worker_reservation_if_current
 
@@ -2886,15 +2899,20 @@ def test_fte_worker_reservation_completion_is_atomic_with_pending_drain(monkeypa
         assert first_reservation_removed.wait(5.0)
 
         fragment_execution = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[(query_id, pending_key[1])]
-        original_schedule_next = fragment_execution.schedule_next_pending_partition
+        original_pop_worker_commands = fragment_execution.pop_worker_commands
 
-        def observed_schedule_next(*args, **kwargs):
-            pending_drain_entered.set()
-            return original_schedule_next(*args, **kwargs)
+        def observed_pop_worker_commands():
+            command_handoff_lock_owned.append(fragment_execution._attempt_scheduling_lock._is_owned())
+            return original_pop_worker_commands()
 
-        monkeypatch.setattr(fragment_execution, "schedule_next_pending_partition", observed_schedule_next)
-        drain = executor.submit(handle._drain_fte_pending_tasks)
-        assert pending_drain_entered.wait(5.0)
+        monkeypatch.setattr(fragment_execution, "pop_worker_commands", observed_pop_worker_commands)
+
+        def drain_pending():
+            pending_drain_started.set()
+            return handle._drain_fte_pending_tasks()
+
+        drain = executor.submit(drain_pending)
+        assert pending_drain_started.wait(5.0)
         allow_first_attempt_start.set()
         completion.result(timeout=5.0)
         drain.result(timeout=5.0)
@@ -2904,7 +2922,205 @@ def test_fte_worker_reservation_completion_is_atomic_with_pending_drain(monkeypa
     assert worker_handle_mod._FTE_PARTITION_OWNERS[pending_key] is handle
     assert pending_key in worker_handle_mod._FTE_PARTITION_TASK_LEASES
     assert pending_key not in worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS
+    assert command_handoff_lock_owned == [True]
     assert [call[1]["task_id"]["partition_id"] for call in actor.fte_calls if call[0] == "create"] == [0, 1]
+
+
+def test_fte_failed_worker_reservation_blocks_concurrent_retry(monkeypatch):
+    query_id = "query-reservation-failure-race"
+    actor, handle, pending_key, pending_future = _submit_strict_worker_reservation_pending_pair(
+        monkeypatch,
+        query_id,
+    )
+    error_format_entered = threading.Event()
+    release_error_format = threading.Event()
+    pending_future.set_exception(
+        _BlockingStringError(
+            "planned worker reservation failure",
+            error_format_entered,
+            release_error_format,
+        )
+    )
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get(query_id)
+    assert scheduler is not None
+    completion_errors = []
+
+    def drain_completion():
+        try:
+            scheduler.drain()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            completion_errors.append(exc)
+
+    completion_thread = threading.Thread(target=drain_completion)
+    completion_thread.start()
+    assert error_format_entered.wait(1.0)
+    try:
+        concurrent_handles = handle._drain_fte_pending_tasks()
+        with worker_handle_mod._FTE_REGISTRY_LOCK:
+            current_future = worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS.get(pending_key)
+            current_generation = worker_handle_mod._FTE_WORKER_RESERVATION_GENERATIONS[pending_key]
+    finally:
+        release_error_format.set()
+        completion_thread.join(2.0)
+
+    assert completion_thread.is_alive() is False
+    assert len(completion_errors) == 1
+    assert isinstance(completion_errors[0], RuntimeError)
+    assert str(completion_errors[0]) == "FTE worker reservation failed: planned worker reservation failure"
+    assert concurrent_handles == []
+    assert current_future is pending_future
+    assert current_generation == pending_future.reservation_generation
+    assert pending_future.done() is True
+    assert pending_key not in worker_handle_mod._FTE_PARTITION_OWNERS
+    assert pending_key not in worker_handle_mod._FTE_PARTITION_TASK_LEASES
+    assert [call[1]["task_id"]["partition_id"] for call in actor.fte_calls if call[0] == "create"] == [0]
+
+
+def test_fte_failed_worker_reservation_ignores_replacement_generation(monkeypatch):
+    query_id = "query-reservation-failure-stale"
+    actor, handle, pending_key, old_future = _submit_strict_worker_reservation_pending_pair(
+        monkeypatch,
+        query_id,
+    )
+    error_format_entered = threading.Event()
+    release_error_format = threading.Event()
+    old_future.set_exception(
+        _BlockingStringError(
+            "planned stale worker reservation failure",
+            error_format_entered,
+            release_error_format,
+        )
+    )
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get(query_id)
+    assert scheduler is not None
+    completion_results = []
+    completion_errors = []
+
+    def drain_completion():
+        try:
+            completion_results.append(scheduler.drain())
+        except BaseException as exc:  # pragma: no cover - asserted below
+            completion_errors.append(exc)
+
+    completion_thread = threading.Thread(target=drain_completion)
+    completion_thread.start()
+    assert error_format_entered.wait(1.0)
+    try:
+        with worker_handle_mod._FTE_REGISTRY_LOCK:
+            removed_future = worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS.pop(pending_key, None)
+            fragment_execution = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[(query_id, pending_key[1])]
+        partition = fragment_execution.partitions[pending_key[2]]
+        new_future, created = handle._fte_worker_placement_manager.request_async(
+            query_id=query_id,
+            fragment_execution_id=fragment_execution.fragment_execution_id,
+            fragment_id=pending_key[1],
+            partition_id=pending_key[2],
+            memory_requirement_bytes=partition.memory_requirement_bytes,
+            execution_class=partition.execution_class,
+            node_requirements=partition.node_requirements,
+            node_requirements_wait_started_at=partition.node_wait_started_at,
+            on_done=handle._enqueue_fte_worker_reservation_completion,
+        )
+    finally:
+        release_error_format.set()
+        completion_thread.join(2.0)
+
+    assert completion_thread.is_alive() is False
+    assert completion_errors == []
+    assert completion_results == [[]]
+    assert removed_future is old_future
+    assert created is True
+    assert new_future.reservation_generation == old_future.reservation_generation + 1
+    assert worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS[pending_key] is new_future
+    assert [call[1]["task_id"]["partition_id"] for call in actor.fte_calls if call[0] == "create"] == [0]
+
+
+def test_fte_failed_worker_reservation_racing_query_drop_is_ignored(monkeypatch):
+    query_id = "query-reservation-failure-drop"
+    actor, handle, pending_key, pending_future = _submit_strict_worker_reservation_pending_pair(
+        monkeypatch,
+        query_id,
+    )
+    error_format_entered = threading.Event()
+    release_error_format = threading.Event()
+    pending_future.set_exception(
+        _BlockingStringError(
+            "planned worker reservation failure",
+            error_format_entered,
+            release_error_format,
+        )
+    )
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get(query_id)
+    assert scheduler is not None
+    completion_results = []
+    completion_errors = []
+
+    def drain_completion():
+        try:
+            completion_results.append(scheduler.drain())
+        except BaseException as exc:  # pragma: no cover - asserted below
+            completion_errors.append(exc)
+
+    completion_thread = threading.Thread(target=drain_completion)
+    completion_thread.start()
+    assert error_format_entered.wait(1.0)
+    try:
+        drop_result = handle.fte_drop_query(query_id)
+    finally:
+        release_error_format.set()
+        completion_thread.join(2.0)
+
+    assert completion_thread.is_alive() is False
+    assert completion_errors == []
+    assert completion_results == [[]]
+    assert drop_result == {"tasks_removed": 1, "tasks_canceled": 0, "fragments_removed": 2}
+    assert pending_key not in worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS
+    assert (query_id, pending_key[1]) not in worker_handle_mod._FTE_FRAGMENT_EXECUTIONS
+    assert [call[1]["task_id"]["partition_id"] for call in actor.fte_calls if call[0] == "create"] == [0]
+
+
+def test_fte_worker_reservation_handle_publication_racing_query_drop_is_ignored(monkeypatch):
+    query_id = "query-reservation-handle-drop"
+    actor, handle, pending_key, _ = _submit_strict_worker_reservation_pending_pair(
+        monkeypatch,
+        query_id,
+    )
+    running = handle.pop_fte_result_handles(query_id)
+    assert len(running) == 1
+    handle_construction_entered = threading.Event()
+    release_handle_construction = threading.Event()
+
+    class _BlockingFteTaskHandle(_FakeFteTaskHandle):
+        def __init__(self, task_id, worker_handle):
+            handle_construction_entered.set()
+            assert release_handle_construction.wait(5.0)
+            super().__init__(task_id, worker_handle)
+
+    monkeypatch.setattr(handle, "_fte_task_handle_cls", lambda: _BlockingFteTaskHandle)
+    completion_errors = []
+
+    def release_running_capacity():
+        try:
+            handle.record_fte_task_terminal(running[0].task_id)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            completion_errors.append(exc)
+
+    completion_thread = threading.Thread(target=release_running_capacity)
+    completion_thread.start()
+    assert handle_construction_entered.wait(1.0)
+    assert [call[1]["task_id"]["partition_id"] for call in actor.fte_calls if call[0] == "create"] == [0, 1]
+    try:
+        drop_result = handle.fte_drop_query(query_id)
+    finally:
+        release_handle_construction.set()
+        completion_thread.join(2.0)
+
+    assert completion_thread.is_alive() is False
+    assert completion_errors == []
+    assert drop_result == {"tasks_removed": 1, "tasks_canceled": 0, "fragments_removed": 2}
+    assert pending_key not in worker_handle_mod._FTE_PENDING_WORKER_RESERVATIONS
+    assert (query_id, pending_key[1]) not in worker_handle_mod._FTE_FRAGMENT_EXECUTIONS
+    assert handle.pop_fte_result_handles(query_id) == []
 
 
 def test_fte_pending_worker_reservation_cancelled_on_query_drop(monkeypatch):
@@ -4044,7 +4260,6 @@ def test_fte_worker_failure_replays_descriptor_on_new_owner(monkeypatch):
         "SplitEventsSubmitted": 1,
         "WorkerReservationCompleted": 2,
         "WorkerFailed": 1,
-        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -4146,7 +4361,6 @@ def test_fte_worker_failure_retry_waits_for_scheduling_delayer(monkeypatch):
         "WorkerReservationCompleted": 2,
         "WorkerFailed": 1,
         "RetryDelayExpired": 1,
-        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -4203,7 +4417,6 @@ def test_fte_split_append_control_failure_replays_on_replacement(monkeypatch):
         "SplitEventsSubmitted": 2,
         "WorkerReservationCompleted": 2,
         "WorkerFailed": 1,
-        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -4275,7 +4488,6 @@ def test_fte_split_queue_full_replays_descriptor_on_replacement(monkeypatch):
         "SplitEventsSubmitted": 2,
         "WorkerReservationCompleted": 2,
         "WorkerFailed": 1,
-        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -4992,7 +5204,6 @@ def test_fte_exchange_selector_event_updates_running_and_pending_consumers(monke
         "WorkerReservationCompleted": 2,
         "ExchangeSelectorUpdated": 1,
         "TaskStatusChanged": 1,
-        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -5757,6 +5968,7 @@ def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
         "fragment_execution_key_for_fte_attempt",
         lambda _attempt_id: (query_id, fragment_id),
     )
+    monkeypatch.setattr(handle, "_drain_fte_pending_tasks", lambda **_kwargs: [])
     worker_handle_mod._FTE_STATUS_WATCHERS[str(attempt_id)] = watcher
     worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[(query_id, fragment_id)] = fragment_execution
     try:
@@ -6038,7 +6250,7 @@ def test_fte_registry_close_waits_for_terminal_handler_and_suppresses_retry(monk
     assert outbox_executions == []
 
 
-def test_fte_terminal_close_race_still_drains_other_queries(monkeypatch):
+def test_fte_terminal_query_drop_race_still_drains_other_queries(monkeypatch):
     monkeypatch.setattr(
         fragment_submission_mod,
         "_split_exchange_source_task_by_partition",
@@ -6095,12 +6307,13 @@ def test_fte_terminal_close_race_still_drains_other_queries(monkeypatch):
     completion_thread.start()
     assert mutation_done.wait(1.0)
 
-    worker_handle_mod.close_fte_registry_for_query("query-a")
+    drop_result = handle.fte_drop_query("query-a")
     release_handler.set()
     completion_thread.join(2.0)
 
     assert completion_thread.is_alive() is False
     assert completion_errors == []
+    assert drop_result == {"tasks_removed": 1, "tasks_canceled": 0, "fragments_removed": 2}
     assert [str(task_handle.task_id) for task_handle in completion_handles] == ["query-b.0.0.0"]
     scheduled_query_b = handle.pop_fte_result_handles("query-b")
     assert [str(task_handle.task_id) for task_handle in scheduled_query_b] == ["query-b.0.0.0"]
@@ -6445,7 +6658,6 @@ def test_fte_task_status_event_marks_partition_finished(monkeypatch):
         "SplitEventsSubmitted": 1,
         "WorkerReservationCompleted": 1,
         "TaskStatusChanged": 1,
-        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -6484,7 +6696,6 @@ def test_fte_task_status_event_retries_failed_attempt(monkeypatch):
         "SplitEventsSubmitted": 1,
         "WorkerReservationCompleted": 2,
         "TaskStatusChanged": 1,
-        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -6523,7 +6734,6 @@ def test_fte_task_status_event_oom_is_terminal_for_registered_heap(monkeypatch):
         "SplitEventsSubmitted": 1,
         "WorkerReservationCompleted": 1,
         "TaskStatusChanged": 1,
-        "ResourceAdmissionChanged": 1,
     }
 
 
@@ -6721,7 +6931,6 @@ def test_fte_input_stream_exhausted_control_failure_replays_sealed_descriptor(mo
         "WorkerReservationCompleted": 2,
         "SourceInputExhausted": 1,
         "WorkerFailed": 1,
-        "ResourceAdmissionChanged": 1,
     }
 
 

@@ -923,9 +923,10 @@ class FteFragmentExecution:
         self._worker_command_outbox.append(command)
 
     def pop_worker_commands(self) -> list[Any]:
-        commands = list(self._worker_command_outbox)
-        self._worker_command_outbox.clear()
-        return commands
+        with self._attempt_scheduling_lock:
+            commands = list(self._worker_command_outbox)
+            self._worker_command_outbox.clear()
+            return commands
 
     def _update_partition_locked(self, update: PartitionUpdate) -> bool:
         partition = self.add_partition(update.partition_id)

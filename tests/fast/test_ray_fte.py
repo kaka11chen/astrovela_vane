@@ -1709,6 +1709,49 @@ def _handle_live_worker_statuses(stage, *, retryable=True):
     return scheduled
 
 
+def test_fte_worker_command_outbox_pop_owns_attempt_scheduling_lock():
+    stage = FteFragmentExecution(
+        "query-outbox-handoff",
+        0,
+        fragment_id="query-outbox-handoff:node:1",
+        task_memory_bytes=1,
+    )
+    copy_started = threading.Event()
+    release_copy = threading.Event()
+
+    class _PausedOutbox(list):
+        def __iter__(self):
+            snapshot = tuple(super().__iter__())
+            copy_started.set()
+            assert release_copy.wait(5.0)
+            return iter(snapshot)
+
+    stage._worker_command_outbox = _PausedOutbox(["first"])
+    popped = []
+    pop_errors = []
+
+    def pop_commands():
+        try:
+            popped.extend(stage.pop_worker_commands())
+        except BaseException as exc:  # pragma: no cover - asserted below
+            pop_errors.append(exc)
+
+    pop_thread = threading.Thread(target=pop_commands)
+    pop_thread.start()
+    assert copy_started.wait(1.0)
+    acquired_during_copy = stage._attempt_scheduling_lock.acquire(blocking=False)
+    if acquired_during_copy:
+        stage._attempt_scheduling_lock.release()
+    release_copy.set()
+    pop_thread.join(2.0)
+
+    assert pop_thread.is_alive() is False
+    assert pop_errors == []
+    assert acquired_during_copy is False
+    assert popped == ["first"]
+    assert stage._worker_command_outbox == []
+
+
 def test_fte_two_query_fragment_callbacks_do_not_cross_state_locks():
     callback_barrier = threading.Barrier(2)
     callback_lock_ownership = {}
