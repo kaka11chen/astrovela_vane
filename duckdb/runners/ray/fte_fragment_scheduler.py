@@ -2813,7 +2813,7 @@ def refresh_fte_running_task_stats(query_id: str | None = None) -> None:
                 validate_fte_status_identity(status, running.attempt_id)
                 if fte_registry_query_is_closing(fragment_execution.query_id):
                     continue
-                fragment_execution.handle_task_status(status)
+                running.remote_handle.handle_fte_task_status(status)
             except Exception:
                 pass
 

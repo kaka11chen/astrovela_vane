@@ -185,6 +185,10 @@ class FteWorkerEventHandlingMixin:
                 self._execute_fte_fragment_execution_outbox(fragment_execution)
         except FteWorkerControlFailure as exc:
             return self._handles_for_fte_worker_control_failure(exc)
+        except Exception:
+            if terminal:
+                self._drain_fte_pending_tasks()
+            raise
         handles = (
             []
             if scheduled is None

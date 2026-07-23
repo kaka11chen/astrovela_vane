@@ -3300,6 +3300,43 @@ def test_fte_pending_drain_is_fair_across_queries(
     assert [str(task_handle.task_id) for task_handle in second_scheduled] == [next_query_a_attempt]
 
 
+def test_fte_status_refresh_drains_released_capacity_across_queries(monkeypatch):
+    monkeypatch.setattr(
+        fragment_submission_mod,
+        "_split_exchange_source_task_by_partition",
+        lambda value: ([(int(value[-1:]), value)], 2, 2, False),
+    )
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=15, worker_id="worker-0")
+
+    def task(query_id):
+        return _FakeTask(
+            name=f"{query_id}-task-0",
+            context={"query_id": query_id, "node_id": "8"},
+            inputs={"3": {"kind": "exchange_source_task", "data": b"p0"}},
+            plan={"plan": "exchange-template"},
+        )
+
+    handle.submit_tasks([task("query-a")])
+    assert handle.submit_tasks([task("query-b")]) == []
+    assert [str(task_handle.task_id) for task_handle in handle.pop_fte_result_handles("query-a")] == ["query-a.0.0.0"]
+
+    monkeypatch.setattr(
+        handle,
+        "fte_get_task_status",
+        lambda task_id, timeout_s=None: {
+            "state": "FINISHED",
+            "task_id": task_id,
+            "version": 1,
+        },
+    )
+    worker_handle_mod.refresh_fte_running_task_stats("query-a")
+
+    query_a_stage = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[("query-a", "query-a:node:8")]
+    assert query_a_stage.partitions[0].finished is True
+    assert [str(task_handle.task_id) for task_handle in handle.pop_fte_result_handles("query-b")] == ["query-b.0.0.0"]
+
+
 def test_fte_pending_drain_prefers_standard_over_speculative(monkeypatch):
     monkeypatch.setattr(
         RayWorkerActorHandle,
@@ -5967,6 +6004,45 @@ def test_fte_terminal_close_race_still_drains_other_queries(monkeypatch):
     assert [str(task_handle.task_id) for task_handle in completion_handles] == ["query-b.0.0.0"]
     scheduled_query_b = handle.pop_fte_result_handles("query-b")
     assert [str(task_handle.task_id) for task_handle in scheduled_query_b] == ["query-b.0.0.0"]
+
+
+def test_fte_terminal_mutation_error_still_drains_other_queries(monkeypatch):
+    monkeypatch.setattr(
+        fragment_submission_mod,
+        "_split_exchange_source_task_by_partition",
+        lambda value: ([(int(value[-1:]), value)], 2, 2, False),
+    )
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=15, worker_id="worker-0")
+
+    def task(query_id):
+        return _FakeTask(
+            name=f"{query_id}-task-0",
+            context={"query_id": query_id, "node_id": "8"},
+            inputs={"3": {"kind": "exchange_source_task", "data": b"p0"}},
+            plan={"plan": "exchange-template"},
+        )
+
+    query_a_handles = handle.submit_tasks([task("query-a")])
+    assert handle.submit_tasks([task("query-b")]) == []
+    assert [str(task_handle.task_id) for task_handle in handle.pop_fte_result_handles("query-a")] == ["query-a.0.0.0"]
+
+    fragment_execution = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[("query-a", "query-a:node:8")]
+
+    def fail_descriptor_remove(_task_id):
+        raise OSError("descriptor spill unlink failed")
+
+    monkeypatch.setattr(fragment_execution.descriptor_storage, "remove", fail_descriptor_remove)
+    with pytest.raises(OSError, match="descriptor spill unlink failed"):
+        handle.handle_fte_task_status(
+            {
+                "state": "FINISHED",
+                "task_id": query_a_handles[0].task_id.to_dict(),
+                "version": 1,
+            }
+        )
+
+    assert [str(task_handle.task_id) for task_handle in handle.pop_fte_result_handles("query-b")] == ["query-b.0.0.0"]
 
 
 def test_fte_registry_close_fences_inflight_remote_mutation_ownership():
