@@ -36,8 +36,13 @@ namespace duckdb {
 struct BoundStatement;
 
 class Binder;
+class DuckDBPyRelation;
+class Expression;
 class LogicalOperator;
+struct PythonReplacementScan;
 class QueryNode;
+class RelationStatement;
+class SelectNode;
 class TableRef;
 
 static string CreateRelationAlias(RelationType type, const string &alias) {
@@ -232,11 +237,78 @@ public:
 	virtual Relation *ChildRelation() {
 		return nullptr;
 	}
+
 	void AddExternalDependency(shared_ptr<ExternalDependency> dependency);
 	DUCKDB_API vector<shared_ptr<ExternalDependency>> GetAllDependencies();
 
 protected:
+	//! Internal capability hooks used while binding relation trees. These are
+	//! deliberately not part of the exported Relation API.
+	virtual bool ContainsNonSQLRelation() {
+		auto child = ChildRelation();
+		return child && child->ContainsNonSQLRelation();
+	}
+	//! Whether GetQueryNode can represent this relation without losing operators
+	//! or binding scopes in the supplied binding context.
+	virtual bool CanSerializeToQueryNodeInternal(Binder &binder) {
+		if (ContainsNonSQLRelation()) {
+			return false;
+		}
+		auto child = ChildRelation();
+		return !child || child->CanSerializeToQueryNodeInternal(binder);
+	}
+	//! Whether this relation can be bound directly as another relation's input.
+	//! SQL-serializable relations use the default SQL binding path. Relations
+	//! with a non-SQL binding path override this independently of serialization.
+	virtual bool CanBindAsInputInternal(Binder &binder) {
+		return CanSerializeToQueryNodeInternal(binder);
+	}
+	//! Build this relation's table reference after the complete relation tree has
+	//! already been validated for SQL serialization.
+	virtual unique_ptr<TableRef> GetTableRefInternal();
+	static unique_ptr<TableRef> GetTableRefForSerialization(Relation &relation);
+	//! Bind this relation for use as another relation's input. Binding-preserving
+	//! relations override this to keep their child's BindContext aligned with the plan.
+	virtual BoundStatement BindAsInput(Binder &binder);
 	DUCKDB_API static string RenderWhitespace(idx_t depth);
+	static bool ExposesMultiSourceBindings(Relation &child);
+	static bool RequiresDirectRelationBinding(Binder &binder, Relation &child);
+	static bool RequiresSQLMultiSourceBinding(Relation &child);
+	static bool CanSerializeExpressionOnBoundChild(Binder &binder, Relation &child, TableRef &bound_child,
+	                                               const ParsedExpression &expression);
+	static unique_ptr<TableRef> BindRelationInput(Binder &binder, Relation &child);
+	static BoundStatement BindSelectNodeOnChild(Binder &binder, Relation &child, unique_ptr<SelectNode> select_node);
+	static unique_ptr<SelectNode> WrapQueryNode(unique_ptr<QueryNode> query_node, const string &alias,
+	                                            const vector<ColumnDefinition> &columns);
+	static unique_ptr<LogicalOperator> PlanRelationFilter(Binder &binder, unique_ptr<Expression> condition,
+	                                                      unique_ptr<LogicalOperator> child);
+	static void ExpandRelationFilter(Binder &binder, unique_ptr<ParsedExpression> &condition);
+
+	static bool ChildContainsNonSQLRelation(Relation &child) {
+		return child.ContainsNonSQLRelation();
+	}
+	static bool ChildCanSerializeToQueryNode(Relation &child, Binder &binder) {
+		return child.CanSerializeToQueryNodeInternal(binder);
+	}
+	static bool ChildCanBindAsInput(Relation &child, Binder &binder) {
+		return child.CanBindAsInputInternal(binder);
+	}
+	static unique_ptr<QueryNode> TryGetSerializableChildQueryNode(Relation &child, Binder &binder) {
+		return child.TryGetSerializableQueryNode(binder);
+	}
+
+private:
+	friend class ClientContext;
+	friend class DuckDBPyRelation;
+	friend class RelationStatement;
+	friend struct PythonReplacementScan;
+
+	//! Return a freshly validated QueryNode, or nullptr if no faithful
+	//! representation exists. These entry points stay private so serialization
+	//! policy does not become part of the public Relation API.
+	DUCKDB_API unique_ptr<QueryNode> TryGetSerializableQueryNode();
+	DUCKDB_API unique_ptr<QueryNode> TryGetSerializableQueryNode(Binder &binder);
+	string GetQuery(Binder &binder);
 
 public:
 	template <class TARGET>

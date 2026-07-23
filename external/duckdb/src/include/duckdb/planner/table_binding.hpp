@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -130,6 +136,9 @@ public:
 	ErrorData ColumnNotFoundError(const string &column_name) const override;
 	// These are columns that are present in the name_map, appearing in the order that they're bound
 	const vector<ColumnIndex> &GetBoundColumnIds() const;
+	//! Prevent virtual columns from being resolved in a later binding scope while
+	//! retaining their metadata for the already-bound child plan.
+	void RemoveVirtualColumnBindings();
 
 protected:
 	ColumnBinding GetColumnBinding(column_t column_index);

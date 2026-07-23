@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
 import duckdb
@@ -48,6 +54,265 @@ class TestRAPIWindows:
         ]
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
+
+    def test_row_number_preserves_expression_name(self, table):
+        result = table.row_number("over (order by id, t)")
+
+        assert result.columns == ["row_number() OVER (ORDER BY id, t)"]
+
+    @pytest.mark.parametrize(
+        ("exchange_method", "plan_node"),
+        [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
+    )
+    def test_window_with_star_preserves_non_sql_exchange(self, table, exchange_method, plan_node):
+        relation = getattr(table, exchange_method)(2).project("*, row_number() OVER (ORDER BY id, t) AS row_number")
+
+        plan = relation.explain()
+        assert plan_node in plan
+        assert "WINDOW" in plan
+
+        rows = sorted(relation.fetchall(), key=lambda row: (row[0], row[2]))
+        assert [row[-1] for row in rows] == list(range(1, 9))
+
+    @pytest.mark.parametrize(
+        ("exchange_method", "plan_node"),
+        [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
+    )
+    def test_row_number_preserves_qualified_join_bindings_and_exchange(self, duckdb_cursor, exchange_method, plan_node):
+        left = duckdb_cursor.sql("SELECT * FROM (VALUES (2), (1)) data(value)").set_alias("left_data")
+        right = duckdb_cursor.sql("SELECT 10 AS join_key").set_alias("right_data")
+        joined = left.join(right, "right_data.join_key = 10")
+        exchanged = getattr(joined, exchange_method)(2)
+
+        result = exchanged.row_number("over (order by left_data.value)", "*")
+
+        plan = result.explain()
+        assert plan_node in plan
+        assert "WINDOW" in plan
+        assert sorted(result.fetchall()) == [(1, 10, 1), (2, 10, 2)]
+
+    def test_window_star_deduplicates_child_column_names(self, duckdb_cursor):
+        relation = duckdb_cursor.sql("SELECT 1 AS x, 2 AS x").row_number("over ()", "*")
+
+        assert relation.columns == ["x", "x_1", "row_number() OVER ()"]
+        assert relation.fetchall() == [(1, 2, 1)]
+
+    def test_window_expands_nested_columns_star(self, duckdb_cursor):
+        relation = duckdb_cursor.sql("SELECT * FROM (VALUES (10, 20), (30, 40)) data(a, b)")
+
+        result = relation.project("COLUMNS(*) + row_number() OVER ()").fetchall()
+
+        assert result == [(11, 21), (32, 42)]
+
+    def test_window_projection_preserves_qualified_aliases_through_filter(self, duckdb_cursor):
+        left = duckdb_cursor.sql("SELECT 1 AS left_value, 10 AS join_key").set_alias("left_data")
+        right = duckdb_cursor.sql("SELECT 2 AS right_value, 10 AS join_key").set_alias("right_data")
+        joined = left.join(right, "left_data.join_key = right_data.join_key").filter("left_data.left_value = 1")
+
+        relation = joined.project("left_data.*, right_data.right_value, row_number() OVER () AS row_number")
+
+        assert relation.columns == ["left_value", "join_key", "right_value", "row_number"]
+        assert relation.fetchall() == [(1, 10, 2, 1)]
+
+    @pytest.mark.parametrize(
+        ("exchange_method", "plan_node"),
+        [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
+    )
+    def test_unqualified_window_projection_preserves_exchange_join(self, duckdb_cursor, exchange_method, plan_node):
+        left = duckdb_cursor.sql("SELECT 1 AS left_value, 10 AS left_key").set_alias("left_data")
+        right = duckdb_cursor.sql("SELECT 2 AS right_value, 10 AS right_key").set_alias("right_data")
+        joined = left.join(right, "left_data.left_key = right_data.right_key")
+        relation = getattr(joined, exchange_method)(2).project("*, row_number() OVER () AS row_number")
+
+        assert plan_node in relation.explain()
+        assert relation.fetchall() == [(1, 10, 2, 10, 1)]
+
+    @pytest.mark.parametrize(
+        ("exchange_method", "plan_node"),
+        [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
+    )
+    @pytest.mark.parametrize(
+        ("filter_before_exchange", "expected"),
+        [(False, [(1, 10), (2, 20)]), (True, [(2, 20)])],
+    )
+    def test_exchange_preserves_qualified_join_bindings(
+        self, duckdb_cursor, exchange_method, plan_node, filter_before_exchange, expected
+    ):
+        left = duckdb_cursor.sql("SELECT * FROM (VALUES (1), (2)) data(left_value)").set_alias("left_data")
+        right = duckdb_cursor.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(right_key, right_value)").set_alias(
+            "right_data"
+        )
+        joined = left.join(right, "left_data.left_value = right_data.right_key")
+        if filter_before_exchange:
+            joined = joined.filter("left_data.left_value = 2")
+
+        exchanged = getattr(joined, exchange_method)(2)
+        result = exchanged.project("left_data.left_value, right_data.right_value")
+
+        assert plan_node in result.explain()
+        assert sorted(result.fetchall()) == expected
+
+    @pytest.mark.parametrize("exchange_method", ["repartition", "local_exchange"])
+    def test_qualified_join_bindings_survive_operations_after_exchange(self, duckdb_cursor, exchange_method):
+        left = duckdb_cursor.sql("SELECT * FROM (VALUES (1), (2)) data(left_value)").set_alias("left_data")
+        right = duckdb_cursor.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(right_key, right_value)").set_alias(
+            "right_data"
+        )
+        joined = left.join(right, "left_data.left_value = right_data.right_key")
+
+        result = (
+            getattr(joined, exchange_method)(2)
+            .filter("left_data.left_value > 0")
+            .order("right_data.right_value DESC")
+            .project("left_data.left_value, right_data.right_value")
+        )
+
+        assert result.fetchall() == [(2, 20), (1, 10)]
+
+    @pytest.mark.parametrize("exchange_method", [None, "repartition", "local_exchange"])
+    def test_window_order_resolves_prior_projection_alias(self, duckdb_cursor, exchange_method):
+        relation = duckdb_cursor.sql("SELECT * FROM (VALUES (2), (1)) data(a)")
+        if exchange_method is not None:
+            relation = getattr(relation, exchange_method)(2)
+
+        result = relation.project("*, a + 1 AS x, row_number() OVER (ORDER BY x) AS row_number").order("a")
+
+        assert result.fetchall() == [(1, 2, 1), (2, 3, 2)]
+
+    def test_window_order_rejects_later_projection_alias(self, duckdb_cursor):
+        relation = duckdb_cursor.sql("SELECT 1 AS a")
+
+        with pytest.raises(duckdb.BinderException, match="cannot be referenced before it is defined"):
+            relation.project("row_number() OVER (ORDER BY x), a + 1 AS x")
+
+    def test_projection_resolves_prior_alias_without_window(self, duckdb_cursor):
+        relation = duckdb_cursor.sql("SELECT 1 AS a")
+
+        result = relation.project("*, a + 1 AS x, x + 1 AS y")
+
+        assert result.fetchall() == [(1, 2, 3)]
+
+    def test_projection_binds_macro_expanded_window(self, duckdb_cursor):
+        duckdb_cursor.execute("CREATE MACRO relation_row_number(x) AS row_number() OVER (ORDER BY x)")
+        relation = duckdb_cursor.sql("SELECT * FROM (VALUES (2), (1)) data(a)")
+
+        result = relation.project("*, relation_row_number(a) AS row_number").order("a")
+
+        assert result.fetchall() == [(1, 1), (2, 2)]
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("(SELECT 42) AS value", [(1, 42), (2, 42)]),
+            ("(SELECT a + 10) AS value", [(1, 11), (2, 12)]),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("exchange_method", "plan_node"),
+        [(None, None), ("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
+    )
+    def test_projection_binds_scalar_subquery(self, duckdb_cursor, expression, expected, exchange_method, plan_node):
+        relation = duckdb_cursor.sql("SELECT * FROM (VALUES (2), (1)) data(a)")
+        if exchange_method is not None:
+            relation = getattr(relation, exchange_method)(2)
+
+        result = relation.project(f"a, {expression}")
+
+        if plan_node is not None:
+            assert plan_node in result.explain()
+        assert sorted(result.fetchall()) == expected
+
+    @pytest.mark.parametrize(
+        ("exchange_method", "plan_node"),
+        [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
+    )
+    def test_projection_unnest_preserves_exchange(self, duckdb_cursor, exchange_method, plan_node):
+        relation = duckdb_cursor.sql("SELECT 1 AS id, [10, 20] AS values")
+        exchanged = getattr(relation, exchange_method)(2)
+        result = exchanged.project("* EXCLUDE (values), unnest(values) AS value")
+
+        assert plan_node in result.explain()
+        assert sorted(result.fetchall()) == [(1, 10), (1, 20)]
+
+    @pytest.mark.parametrize(
+        ("exchange_method", "plan_node"),
+        [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
+    )
+    def test_alias_after_exchange_preserves_plan_node(self, duckdb_cursor, exchange_method, plan_node):
+        relation = duckdb_cursor.sql("SELECT 1 AS a")
+        exchanged = getattr(relation, exchange_method)(2).set_alias("wrapped")
+        projected = exchanged.project("wrapped.a, row_number() OVER () AS row_number")
+
+        assert plan_node in projected.explain()
+        assert projected.fetchall() == [(1, 1)]
+
+    def test_alias_is_binding_boundary_over_join(self, duckdb_cursor):
+        left = duckdb_cursor.sql("SELECT 1 AS left_value, 10 AS left_key").set_alias("left_data")
+        right = duckdb_cursor.sql("SELECT 2 AS right_value, 10 AS right_key").set_alias("right_data")
+        wrapped = left.join(right, "left_data.left_key = right_data.right_key").set_alias("wrapped")
+
+        result = wrapped.filter("wrapped.left_value = 1").project("wrapped.*, row_number() OVER () AS row_number")
+
+        assert result.fetchall() == [(1, 10, 2, 10, 1)]
+
+    @pytest.mark.parametrize(
+        ("exchange_method", "plan_node"),
+        [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
+    )
+    def test_alias_over_exchange_join_preserves_plan_node(self, duckdb_cursor, exchange_method, plan_node):
+        left = duckdb_cursor.sql("SELECT 1 AS left_value, 10 AS left_key").set_alias("left_data")
+        right = duckdb_cursor.sql("SELECT 2 AS right_value, 10 AS right_key").set_alias("right_data")
+        joined = left.join(right, "left_data.left_key = right_data.right_key")
+        wrapped = getattr(joined, exchange_method)(2).set_alias("wrapped")
+
+        result = wrapped.project("wrapped.*, row_number() OVER () AS row_number")
+
+        assert plan_node in result.explain()
+        assert result.fetchall() == [(1, 10, 2, 10, 1)]
+        with pytest.raises(duckdb.BinderException, match='Referenced table "left_data" not found'):
+            wrapped.project("left_data.left_value")
+
+    @pytest.mark.parametrize(
+        ("exchange_method", "plan_node"),
+        [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
+    )
+    @pytest.mark.parametrize(
+        ("operation", "child_plan_node"),
+        [("project", "PROJECTION"), ("distinct", "HASH_GROUP_BY"), ("order", "ORDER_BY")],
+    )
+    def test_window_preserves_exchange_after_unary_operation(
+        self, duckdb_cursor, exchange_method, plan_node, operation, child_plan_node
+    ):
+        relation = duckdb_cursor.sql("SELECT * FROM (VALUES (2), (1), (1)) data(id)")
+        if operation == "project":
+            relation = relation.project("id, id + 10 AS projected")
+            expected = [(1, 11, 1), (1, 11, 2), (2, 12, 3)]
+        elif operation == "distinct":
+            relation = relation.distinct()
+            expected = [(1, 1), (2, 2)]
+        else:
+            relation = relation.order("id DESC")
+            expected = [(1, 1), (1, 2), (2, 3)]
+
+        result = getattr(relation, exchange_method)(2).row_number("OVER (ORDER BY id)", "*")
+        plan = result.explain()
+
+        assert plan_node in plan
+        exchange_position = plan.index(plan_node)
+        assert plan.index("WINDOW") < exchange_position
+        assert plan.find(child_plan_node, exchange_position + len(plan_node)) >= 0
+        assert result.fetchall() == expected
+
+    @pytest.mark.parametrize("exchange_method", ["repartition", "local_exchange"])
+    def test_struct_field_projection_over_exchange_join(self, duckdb_cursor, exchange_method):
+        left = duckdb_cursor.sql("SELECT {'a': 7} AS payload, 10 AS left_key").set_alias("left_data")
+        right = duckdb_cursor.sql("SELECT 10 AS right_key").set_alias("right_data")
+        joined = left.join(right, "left_data.left_key = right_data.right_key")
+        exchanged = getattr(joined, exchange_method)(2)
+
+        result = exchanged.project("payload.a, row_number() OVER () AS row_number")
+
+        assert result.fetchall() == [(7, 1)]
 
     def test_rank(self, table):
         result = table.rank("over ()").execute().fetchall()

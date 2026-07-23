@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "duckdb/main/relation/local_exchange_relation.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
 #include "duckdb/execution/operator/exchange/repartition.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -20,20 +21,8 @@ LocalExchangeRelation::LocalExchangeRelation(shared_ptr<Relation> child_p, idx_t
 }
 
 unique_ptr<QueryNode> LocalExchangeRelation::GetQueryNode() {
-	// LocalExchange has no SQL representation, but we must NOT return
-	// child->GetQueryNode() directly.  Doing so makes this node invisible
-	// to downstream Relation operations (e.g. LimitRelation::GetQueryNode())
-	// which modify the child query node in-place and silently drop the
-	// LOCAL_EXCHANGE from the final plan.
-	//
-	// Instead, wrap the child as a subquery table-reference so that the
-	// child's plan is opaque to the parent.  When this node is actually
-	// bound, LocalExchangeRelation::Bind() (not the base-class SQL path)
-	// is called and properly inserts LogicalLocalExchange.
-	auto select = make_uniq<SelectNode>();
-	select->from_table = child->GetTableRef();
-	select->select_list.push_back(make_uniq<StarExpression>());
-	return std::move(select);
+	throw NotImplementedException(
+	    "A local-exchange relation has no SQL query-node representation; converting it would discard the exchange");
 }
 
 string LocalExchangeRelation::GetQuery() {
@@ -49,7 +38,14 @@ const vector<ColumnDefinition> &LocalExchangeRelation::Columns() {
 }
 
 BoundStatement LocalExchangeRelation::Bind(Binder &binder) {
-	auto child_bound = child->Bind(binder);
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list.push_back(make_uniq<StarExpression>());
+	return BindSelectNodeOnChild(binder, *this, std::move(select_node));
+}
+
+BoundStatement LocalExchangeRelation::BindAsInput(Binder &binder) {
+	auto child_ref = BindRelationInput(binder, *child);
+	auto child_bound = binder.Bind(*child_ref);
 
 	size_t num_partitions_sz = static_cast<size_t>(num_partitions);
 	auto spec = RepartitionSpec::create_random(num_partitions_sz);

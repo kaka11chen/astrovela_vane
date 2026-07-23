@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation/table_relation.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
@@ -7,6 +13,7 @@
 #include "duckdb/main/relation/update_relation.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
@@ -22,16 +29,21 @@ TableRelation::TableRelation(const shared_ptr<RelationContextWrapper> &context,
 unique_ptr<QueryNode> TableRelation::GetQueryNode() {
 	auto result = make_uniq<SelectNode>();
 	result->select_list.push_back(make_uniq<StarExpression>());
-	result->from_table = GetTableRef();
+	result->from_table = GetTableRefForSerialization(*this);
 	return std::move(result);
 }
 
-unique_ptr<TableRef> TableRelation::GetTableRef() {
+unique_ptr<TableRef> TableRelation::GetTableRefInternal() {
 	auto table_ref = make_uniq<BaseTableRef>();
 	table_ref->schema_name = description->schema;
 	table_ref->table_name = description->table;
 	table_ref->catalog_name = description->database;
 	return std::move(table_ref);
+}
+
+BoundStatement TableRelation::BindAsInput(Binder &binder) {
+	auto table_ref = GetTableRefForSerialization(*this);
+	return binder.Bind(*table_ref);
 }
 
 string TableRelation::GetAlias() {

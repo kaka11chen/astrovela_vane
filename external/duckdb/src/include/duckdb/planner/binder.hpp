@@ -202,6 +202,7 @@ struct QueryBinderState {
 */
 class Binder : public enable_shared_from_this<Binder> {
 	friend class ExpressionBinder;
+	friend class Relation;
 	friend class RecursiveDependentJoinPlanner;
 
 public:

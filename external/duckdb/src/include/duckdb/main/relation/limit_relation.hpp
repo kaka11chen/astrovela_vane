@@ -41,6 +41,13 @@ public:
 	Relation *ChildRelation() override {
 		return child.get();
 	}
+
+protected:
+	bool CanBindAsInputInternal(Binder &binder) override {
+		return ChildCanBindAsInput(*child, binder);
+	}
+
+	BoundStatement BindAsInput(Binder &binder) override;
 };
 
 } // namespace duckdb

@@ -457,7 +457,17 @@ string DuckDBPyRelation::ToSQL() {
 		return "";
 	}
 	try {
-		return rel->GetQueryNode()->ToString();
+		unique_ptr<QueryNode> query_node;
+		{
+			D_ASSERT(py::gil_check());
+			py::gil_scoped_release release;
+			query_node = rel->TryGetSerializableQueryNode();
+		}
+		if (!query_node) {
+			// Some logical operators and binding scopes have no faithful SQL representation.
+			return "";
+		}
+		return query_node->ToString();
 	} catch (const std::exception &) {
 		return "";
 	}

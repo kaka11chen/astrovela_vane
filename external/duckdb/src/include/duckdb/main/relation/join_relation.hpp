@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -38,7 +44,16 @@ public:
 	const vector<ColumnDefinition> &Columns() override;
 	string ToString(idx_t depth) override;
 
-	unique_ptr<TableRef> GetTableRef() override;
+protected:
+	bool ContainsNonSQLRelation() override {
+		return ChildContainsNonSQLRelation(*left) || ChildContainsNonSQLRelation(*right);
+	}
+	bool CanSerializeToQueryNodeInternal(Binder &binder) override {
+		return ChildCanSerializeToQueryNode(*left, binder) && ChildCanSerializeToQueryNode(*right, binder);
+	}
+
+	unique_ptr<TableRef> GetTableRefInternal() override;
+	BoundStatement BindAsInput(Binder &binder) override;
 };
 
 } // namespace duckdb

@@ -35,6 +35,15 @@ public:
 	const vector<ColumnDefinition> &Columns() override;
 	string ToString(idx_t depth) override;
 	string GetAlias() override;
+
+protected:
+	bool ContainsNonSQLRelation() override {
+		return ChildContainsNonSQLRelation(*child);
+	}
+	bool CanSerializeToQueryNodeInternal(Binder &binder) override;
+	bool CanBindAsInputInternal(Binder &binder) override {
+		return ChildCanBindAsInput(*child, binder);
+	}
 };
 
 } // namespace duckdb

@@ -38,6 +38,11 @@ public:
 		return child.get();
 	}
 
+protected:
+	bool CanBindAsInputInternal(Binder &binder) override {
+		return ChildCanBindAsInput(*child, binder);
+	}
+
 private:
 	vector<ColumnDefinition> columns;
 };

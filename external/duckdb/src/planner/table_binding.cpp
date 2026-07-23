@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/planner/table_binding.hpp"
 
 #include "duckdb/common/string_util.hpp"
@@ -224,12 +230,22 @@ const vector<ColumnIndex> &TableBinding::GetBoundColumnIds() const {
 		D_ASSERT(result.second);
 		auto it = std::find_if(name_map.begin(), name_map.end(),
 		                       [&](const std::pair<const string, idx_t> &it) { return it.second == id; });
-		// assert that every id appears in the name_map
-		D_ASSERT(it != name_map.end());
+		// Virtual columns can be hidden from a later binding scope after they
+		// have already been bound in the child plan.
+		D_ASSERT(it != name_map.end() || virtual_columns.find(id) != virtual_columns.end());
 		// the order that they appear in is not guaranteed to be sequential
 	}
 #endif
 	return bound_column_ids;
+}
+
+void TableBinding::RemoveVirtualColumnBindings() {
+	for (auto &virtual_column : virtual_columns) {
+		auto entry = name_map.find(virtual_column.second.name);
+		if (entry != name_map.end() && entry->second == virtual_column.first) {
+			name_map.erase(entry);
+		}
+	}
 }
 
 ColumnBinding TableBinding::GetColumnBinding(column_t column_index) {

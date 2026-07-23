@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import platform
 import sys
 
@@ -26,6 +32,63 @@ def scoped_default(duckdb_cursor):
 
 
 class TestRAPIQuery:
+    def test_sql_query_preserves_result_modifier_boundaries(self, duckdb_cursor):
+        values = duckdb_cursor.sql("SELECT * FROM (VALUES (1), (1), (2)) data(id)").order("id")
+
+        limited_distinct = values.limit(2).distinct()
+        limited_distinct_sql = limited_distinct.sql_query()
+        assert limited_distinct_sql
+        assert limited_distinct.fetchall() == [(1,)]
+        assert duckdb_cursor.sql(limited_distinct_sql).fetchall() == [(1,)]
+        assert duckdb_cursor.sql("SELECT * FROM limited_distinct").fetchall() == [(1,)]
+
+        double_limit = values.limit(2).limit(1)
+        double_limit_sql = double_limit.sql_query()
+        assert double_limit_sql
+        assert double_limit.fetchall() == [(1,)]
+        assert duckdb_cursor.sql(double_limit_sql).fetchall() == [(1,)]
+        assert duckdb_cursor.sql("SELECT * FROM double_limit").fetchall() == [(1,)]
+
+        union_distinct = duckdb_cursor.sql("SELECT 1 AS id").union(duckdb_cursor.sql("SELECT 1 AS id")).distinct()
+        union_distinct_sql = union_distinct.sql_query()
+        assert union_distinct_sql
+        assert union_distinct.fetchall() == [(1,)]
+        assert duckdb_cursor.sql(union_distinct_sql).fetchall() == [(1,)]
+        assert duckdb_cursor.sql("SELECT * FROM union_distinct").fetchall() == [(1,)]
+
+        duplicate_names = duckdb_cursor.sql("SELECT 1 AS x, 2 AS x").limit(1).distinct()
+        duplicate_names_sql = duplicate_names.sql_query()
+        assert duplicate_names.columns == ["x", "x"]
+        assert duckdb_cursor.sql(duplicate_names_sql).columns == ["x", "x"]
+
+    def test_distinct_above_order_requires_a_final_order_for_deterministic_results(self, duckdb_cursor):
+        values = duckdb_cursor.sql("SELECT * FROM (VALUES (1), (1), (2)) data(id)")
+        ordered_distinct = values.order("id DESC").distinct()
+
+        plan = ordered_distinct.explain()
+        assert plan.index("HASH_GROUP_BY") < plan.index("ORDER_BY")
+        assert ordered_distinct.order("id").fetchall() == [(1,), (2,)]
+
+    @pytest.mark.parametrize(
+        ("operation", "expected"),
+        [
+            ("project", [(1,), (2,)]),
+            ("filter", [(2,)]),
+            ("order", [(2,), (1,)]),
+        ],
+    )
+    def test_explicit_alias_is_binding_boundary_after_filter(self, duckdb_cursor, operation, expected):
+        relation = duckdb_cursor.sql("SELECT * FROM (VALUES (2), (1), (-1)) data(id)").filter("id > 0").set_alias("foo")
+
+        if operation == "project":
+            result = relation.project("foo.id").order("foo.id")
+        elif operation == "filter":
+            result = relation.filter("foo.id > 1")
+        else:
+            result = relation.order("foo.id DESC")
+
+        assert result.fetchall() == expected
+
     @pytest.mark.parametrize("steps", [1, 2, 3, 4])
     def test_query_chain(self, steps):
         con = duckdb.default_connection()

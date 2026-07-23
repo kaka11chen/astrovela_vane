@@ -1,7 +1,14 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation/aggregate_relation.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
@@ -40,18 +47,14 @@ AggregateRelation::AggregateRelation(shared_ptr<Relation> child_p,
 }
 
 unique_ptr<QueryNode> AggregateRelation::GetQueryNode() {
-	auto child_ptr = child.get();
-	while (child_ptr->InheritsColumnBindings()) {
-		child_ptr = child_ptr->ChildRelation();
-	}
 	unique_ptr<QueryNode> result;
-	if (child_ptr->type == RelationType::JOIN_RELATION) {
-		// child node is a join: push projection into the child query node
+	if (RequiresSQLMultiSourceBinding(*child)) {
+		// The child has multiple source bindings: push aggregation into its query node.
 		result = child->GetQueryNode();
 	} else {
-		// child node is not a join: create a new select node and push the child as a table reference
+		// The child has one source binding: create a new select node around its table reference.
 		auto select = make_uniq<SelectNode>();
-		select->from_table = child->GetTableRef();
+		select->from_table = GetTableRefForSerialization(*child);
 		result = std::move(select);
 	}
 	D_ASSERT(result->type == QueryNodeType::SELECT_NODE);
@@ -68,6 +71,45 @@ unique_ptr<QueryNode> AggregateRelation::GetQueryNode() {
 		select_node.select_list.push_back(expr->Copy());
 	}
 	return result;
+}
+
+BoundStatement AggregateRelation::Bind(Binder &binder) {
+	if (!RequiresDirectRelationBinding(binder, *child)) {
+		return Relation::Bind(binder);
+	}
+	auto select_node = make_uniq<SelectNode>();
+	if (!groups.group_expressions.empty()) {
+		select_node->aggregate_handling = AggregateHandling::STANDARD_HANDLING;
+		select_node->groups = groups.Copy();
+	} else {
+		select_node->aggregate_handling = AggregateHandling::FORCE_AGGREGATES;
+	}
+	for (auto &expr : expressions) {
+		select_node->select_list.push_back(expr->Copy());
+	}
+	return BindSelectNodeOnChild(binder, *child, std::move(select_node));
+}
+
+bool AggregateRelation::CanSerializeToQueryNodeInternal(Binder &binder) {
+	if (!ChildCanSerializeToQueryNode(*child, binder)) {
+		return false;
+	}
+	if (!child->InheritsColumnBindings() || RequiresSQLMultiSourceBinding(*child)) {
+		return true;
+	}
+	auto serialization_binder = Binder::CreateBinder(binder.context);
+	auto serialization_input = BindRelationInput(*serialization_binder, *child);
+	for (auto &expression : expressions) {
+		if (!CanSerializeExpressionOnBoundChild(*serialization_binder, *child, *serialization_input, *expression)) {
+			return false;
+		}
+	}
+	for (auto &group : groups.group_expressions) {
+		if (!CanSerializeExpressionOnBoundChild(*serialization_binder, *child, *serialization_input, *group)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 string AggregateRelation::GetAlias() {

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation/create_table_relation.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -23,8 +29,14 @@ CreateTableRelation::CreateTableRelation(shared_ptr<Relation> child_p, string ca
 }
 
 BoundStatement CreateTableRelation::Bind(Binder &binder) {
+	auto query_node = TryGetSerializableChildQueryNode(*child, binder);
+	if (!query_node) {
+		throw NotImplementedException(
+		    "Cannot create a table from a relation that cannot be faithfully represented as a "
+		    "SQL query node; conversion would discard the exchange or lose relation bindings");
+	}
 	auto select = make_uniq<SelectStatement>();
-	select->node = child->GetQueryNode();
+	select->node = std::move(query_node);
 
 	CreateStatement stmt;
 	auto info = make_uniq<CreateTableInfo>();

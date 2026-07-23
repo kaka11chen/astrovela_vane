@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation/join_relation.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
@@ -5,6 +11,7 @@
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/main/client_context_wrapper.hpp"
+#include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
@@ -31,14 +38,22 @@ JoinRelation::JoinRelation(shared_ptr<Relation> left_p, shared_ptr<Relation> rig
 unique_ptr<QueryNode> JoinRelation::GetQueryNode() {
 	auto result = make_uniq<SelectNode>();
 	result->select_list.push_back(make_uniq<StarExpression>());
-	result->from_table = GetTableRef();
+	result->from_table = GetTableRefForSerialization(*this);
 	return std::move(result);
 }
 
-unique_ptr<TableRef> JoinRelation::GetTableRef() {
+BoundStatement JoinRelation::BindAsInput(Binder &binder) {
+	if (ContainsNonSQLRelation()) {
+		return Relation::Bind(binder);
+	}
+	auto table_ref = GetTableRefForSerialization(*this);
+	return binder.Bind(*table_ref);
+}
+
+unique_ptr<TableRef> JoinRelation::GetTableRefInternal() {
 	auto join_ref = make_uniq<JoinRef>(join_ref_type);
-	join_ref->left = left->GetTableRef();
-	join_ref->right = right->GetTableRef();
+	join_ref->left = GetTableRefForSerialization(*left);
+	join_ref->right = GetTableRefForSerialization(*right);
 	if (condition) {
 		join_ref->condition = condition->Copy();
 	}

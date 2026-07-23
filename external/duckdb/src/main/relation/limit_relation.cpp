@@ -8,6 +8,7 @@
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
@@ -22,6 +23,12 @@ LimitRelation::LimitRelation(shared_ptr<Relation> child_p, int64_t limit, int64_
 
 unique_ptr<QueryNode> LimitRelation::GetQueryNode() {
 	auto child_node = child->GetQueryNode();
+	if (std::any_of(child_node->modifiers.begin(), child_node->modifiers.end(), [](const auto &modifier) {
+		    return modifier->type == ResultModifierType::LIMIT_MODIFIER ||
+		           modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER;
+	    })) {
+		child_node = WrapQueryNode(std::move(child_node), child->GetAlias(), child->Columns());
+	}
 	auto limit_node = make_uniq<LimitModifier>();
 	if (limit >= 0) {
 		limit_node->limit = make_uniq<ConstantExpression>(Value::BIGINT(limit));
@@ -52,9 +59,19 @@ string LimitRelation::ToString(idx_t depth) {
 }
 
 BoundStatement LimitRelation::Bind(Binder &binder) {
+	if (!RequiresDirectRelationBinding(binder, *child)) {
+		return Relation::Bind(binder);
+	}
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list.push_back(make_uniq<StarExpression>());
+	return BindSelectNodeOnChild(binder, *this, std::move(select_node));
+}
+
+BoundStatement LimitRelation::BindAsInput(Binder &binder) {
 	// Bind child directly (NOT through the SQL GetQueryNode() round-trip)
 	// to preserve non-SQL-representable child nodes like LocalExchangeRelation.
-	auto child_bound = child->Bind(binder);
+	auto child_ref = BindRelationInput(binder, *child);
+	auto child_bound = binder.Bind(*child_ref);
 
 	BoundLimitNode limit_val_bound;
 	BoundLimitNode offset_val_bound;

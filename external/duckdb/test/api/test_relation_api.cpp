@@ -9,6 +9,8 @@
 #include "duckdb/common/enums/joinref_type.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/main/relation/explain_relation.hpp"
+#include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/main/relation/value_relation.hpp"
 #include "iostream"
 #include "test_helpers.hpp"
@@ -941,6 +943,25 @@ TEST_CASE("Test table function relations", "[relation_api]") {
 	REQUIRE_THROWS(con.TableFunction("blabla"));
 }
 
+TEST_CASE("Test non-SQL exchanges with table in-out functions", "[relation_api][exchange]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	auto values = con.Values("(42)", {"i"});
+	REQUIRE_NOTHROW(result =
+	                    values->Repartition(2, duckdb::vector<string> {})->TableFunction("summary", {})->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {"[42]"}));
+	REQUIRE_NOTHROW(result = values->LocalExchange(2)->TableFunction("summary", {})->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {"[42]"}));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE MACRO relation_macro(x) AS TABLE SELECT x AS i"));
+	REQUIRE_THROWS_WITH(values->Repartition(2, duckdb::vector<string> {})->TableFunction("relation_macro", {}),
+	                    Catch::Matchers::Contains("would discard"));
+	REQUIRE_THROWS_WITH(values->LocalExchange(2)->TableFunction("relation_macro", {}),
+	                    Catch::Matchers::Contains("would discard"));
+}
+
 TEST_CASE("Test CSV Relation with union by name", "[relation_api]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -1084,9 +1105,11 @@ TEST_CASE("Test Relation Query setting query", "[relation_api]") {
 	DuckDB db;
 	Connection con(db);
 
-	auto query = con.RelationFromQuery("SELECT current_query()");
-	auto result = query->Limit(1)->Execute();
-	REQUIRE(!result->Fetch()->GetValue(0, 0).ToString().empty());
+	const string query_text = "SELECT current_query() /* preserve relation query text */";
+	auto statement = QueryRelation::ParseStatement(*con.context, query_text, "Expected a SELECT statement");
+	auto query = con.RelationFromQuery(std::move(statement), "queryrelation", query_text);
+	auto result = query->Execute();
+	REQUIRE(result->Fetch()->GetValue(0, 0).ToString() == query_text);
 }
 
 TEST_CASE("Construct ValueRelation with RelationContextWrapper and operate on it", "[relation_api][txn][wrapper]") {
@@ -1173,6 +1196,72 @@ TEST_CASE("Test create table with empty name", "[relation_api]") {
 	REQUIRE_THROWS_AS(values->Create(""), ParserException);
 }
 
+TEST_CASE("Relation input binding is independent from SQL serialization", "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE binding_left(id INTEGER, value INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO binding_left VALUES (1, 10), (2, 20)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE binding_right(id INTEGER, value INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO binding_right VALUES (1, 100), (2, 200)"));
+
+	auto left = con.Table("binding_left")->Alias("l");
+	auto right = con.Table("binding_right")->Alias("r");
+	auto distinct_join = left->Join(right, "l.id = r.id")->Distinct();
+	REQUIRE_NOTHROW(result = distinct_join->Aggregate("count(*)")->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {2}));
+
+	auto direct_bound = distinct_join->Project("r.value AS x");
+	REQUIRE(direct_bound->GetQuery().empty());
+	REQUIRE_THROWS_AS(direct_bound->GetTableRef(), NotImplementedException);
+	REQUIRE_NOTHROW(result = direct_bound->Filter("x > 100")->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {200}));
+
+	auto exchange = left->LocalExchange(2);
+	REQUIRE(exchange->GetQuery().empty());
+	REQUIRE_NOTHROW(result = exchange->Execute());
+
+	auto explain = make_shared_ptr<ExplainRelation>(left);
+	REQUIRE(explain->GetQuery().empty());
+	REQUIRE_THROWS_AS(explain->GetTableRef(), NotImplementedException);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE semi_left(left_id INTEGER, left_value VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO semi_left VALUES (1, 'one'), (2, 'two'), (2, 'two')"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE semi_right(right_id INTEGER, right_value BIGINT)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO semi_right VALUES (1, 100), (3, 300), (3, 300)"));
+	auto semi_left = con.Table("semi_left")->Alias("sl");
+	auto semi_right = con.Table("semi_right")->Alias("sr");
+
+	auto left_semi = semi_left->Join(semi_right, "sl.left_id = sr.right_id", JoinType::SEMI)
+	                     ->Distinct()
+	                     ->Project("sl.left_id, sl.left_value");
+	REQUIRE_NOTHROW(result = left_semi->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE(CHECK_COLUMN(result, 1, {"one"}));
+
+	auto left_anti = semi_left->Join(semi_right, "sl.left_id = sr.right_id", JoinType::ANTI)
+	                     ->Distinct()
+	                     ->Project("sl.left_id, sl.left_value");
+	REQUIRE_NOTHROW(result = left_anti->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {2}));
+	REQUIRE(CHECK_COLUMN(result, 1, {"two"}));
+
+	auto right_semi = semi_left->Join(semi_right, "sl.left_id = sr.right_id", JoinType::RIGHT_SEMI)
+	                      ->Distinct()
+	                      ->Project("sr.right_id, sr.right_value");
+	REQUIRE_NOTHROW(result = right_semi->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE(CHECK_COLUMN(result, 1, {100}));
+
+	auto right_anti = semi_left->Join(semi_right, "sl.left_id = sr.right_id", JoinType::RIGHT_ANTI)
+	                      ->Distinct()
+	                      ->Project("sr.right_id, sr.right_value");
+	REQUIRE_NOTHROW(result = right_anti->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {3}));
+	REQUIRE(CHECK_COLUMN(result, 1, {300}));
+}
+
 TEST_CASE("Test LocalExchange preserved after Limit", "[relation_api][local_exchange]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -1235,4 +1324,188 @@ TEST_CASE("Test LocalExchange preserved after Limit", "[relation_api][local_exch
 	}
 	// The EXPLAIN output should contain LOCAL_EXCHANGE
 	REQUIRE(explain_str.find("LOCAL_EXCHANGE") != string::npos);
+}
+
+TEST_CASE("Empty order is an identity and inherits child serializability", "[relation_api][local_exchange]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("PRAGMA enable_verification"));
+	auto values = con.Values("(42)");
+	duckdb::vector<OrderByNode> serializable_orders;
+	auto serializable_order = values->Order(std::move(serializable_orders));
+	REQUIRE_FALSE(serializable_order->GetQuery().empty());
+	REQUIRE_NOTHROW(result = serializable_order->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+
+	auto exchange = con.Values("(42)")->LocalExchange(2);
+	duckdb::vector<OrderByNode> exchange_orders;
+	auto ordered = exchange->Order(std::move(exchange_orders));
+
+	REQUIRE(ordered->GetQuery().empty());
+	REQUIRE_NOTHROW(result = ordered->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+	REQUIRE_NOTHROW(result = ordered->Limit(1)->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+}
+
+TEST_CASE("Bound local query scopes determine relation serialization", "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE scope_left(id INTEGER, join_key INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO scope_left VALUES (7, 1)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE scope_right(join_key INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO scope_right VALUES (1)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE local_scope_source(id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO local_scope_source VALUES (42)"));
+
+	auto left = con.Table("scope_left")->Alias("l");
+	auto right = con.Table("scope_right")->Alias("r");
+	auto boundary = left->Join(right, "l.join_key = r.join_key")->Distinct();
+
+	auto correlated = boundary->Project("(SELECT l.id) AS value");
+	REQUIRE(correlated->GetQuery().empty());
+	REQUIRE_NOTHROW(result = correlated->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {7}));
+
+	auto local = boundary->Project("(SELECT l.id FROM local_scope_source AS l) AS value");
+	REQUIRE_FALSE(local->GetQuery().empty());
+	REQUIRE_NOTHROW(result = local->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE MACRO relation_field(value) AS value.id"));
+	auto macro_correlated = boundary->Project("relation_field(l) AS value");
+	REQUIRE(macro_correlated->GetQuery().empty());
+	REQUIRE_NOTHROW(result = macro_correlated->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {7}));
+
+	auto using_boundary = left->Join(right, "join_key")->Distinct();
+	auto surviving_output = using_boundary->Project("(SELECT join_key) AS value");
+	REQUIRE_FALSE(surviving_output->GetQuery().empty());
+	REQUIRE_NOTHROW(result = surviving_output->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+
+	auto outer_boundary = left->Join(right, "join_key", JoinType::OUTER)->Distinct();
+	auto coalesced_output = outer_boundary->Project("(SELECT join_key) AS value");
+	REQUIRE_FALSE(coalesced_output->GetQuery().empty());
+	REQUIRE_NOTHROW(result = coalesced_output->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+}
+
+TEST_CASE("Relation serialization follows current catalog bindings", "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("CREATE VIEW local_scope_source AS SELECT 42 AS right_value"));
+	auto left = con.RelationFromQuery("SELECT 1 AS join_key", "l");
+	auto right = con.RelationFromQuery("SELECT 1 AS join_key, 100 AS right_value", "r");
+	auto relation = left->Join(right, "l.join_key = r.join_key")
+	                    ->Distinct()
+	                    ->Project("(SELECT r.right_value FROM local_scope_source AS r) AS value");
+
+	REQUIRE_FALSE(relation->GetQuery().empty());
+	REQUIRE_NOTHROW(result = relation->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE OR REPLACE VIEW local_scope_source AS SELECT 99 AS other"));
+	REQUIRE(relation->GetQuery().empty());
+	REQUIRE_NOTHROW(result = relation->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {100}));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE OR REPLACE VIEW local_scope_source AS SELECT 84 AS right_value"));
+	REQUIRE_FALSE(relation->GetQuery().empty());
+	REQUIRE_NOTHROW(result = relation->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {84}));
+}
+
+TEST_CASE("Relation SQL preserves result modifier boundaries", "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE modifier_values(id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO modifier_values VALUES (1), (1), (2)"));
+	auto values = con.Table("modifier_values")->Order("id");
+
+	auto limited_distinct = values->Limit(2)->Distinct();
+	REQUIRE_NOTHROW(result = limited_distinct->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE_FALSE(limited_distinct->GetQuery().empty());
+	REQUIRE_NOTHROW(result = con.Query(limited_distinct->GetQuery()));
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+
+	auto double_limit = values->Limit(2)->Limit(1);
+	REQUIRE_NOTHROW(result = double_limit->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE_FALSE(double_limit->GetQuery().empty());
+	REQUIRE_NOTHROW(result = con.Query(double_limit->GetQuery()));
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+
+	auto union_left = con.RelationFromQuery("SELECT 1 AS id", "union_left");
+	auto union_right = con.RelationFromQuery("SELECT 1 AS id", "union_right");
+	auto union_distinct = union_left->Union(union_right)->Distinct();
+	REQUIRE_NOTHROW(result = union_distinct->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE_FALSE(union_distinct->GetQuery().empty());
+	REQUIRE_NOTHROW(result = con.Query(union_distinct->GetQuery()));
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+}
+
+TEST_CASE("Struct fields preserve relation serialization boundaries", "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE nested_left AS SELECT "
+	                          "{'a': {'b': {'c': {'d': 7}}}} AS payload, 1 AS id"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE nested_right AS SELECT 1 AS id"));
+	auto left = con.Table("nested_left")->Alias("l");
+	auto right = con.Table("nested_right")->Alias("r");
+	auto boundary = left->Join(right, "l.id = r.id")->Distinct();
+
+	auto serialized = boundary->Project("payload.a.b.c.d AS value");
+	REQUIRE_FALSE(serialized->GetQuery().empty());
+	REQUIRE_NOTHROW(result = serialized->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {7}));
+
+	auto direct_bound = boundary->Project("l.payload.a.b.c.d AS value");
+	REQUIRE(direct_bound->GetQuery().empty());
+	REQUIRE_NOTHROW(result = direct_bound->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {7}));
+}
+
+TEST_CASE("Distinct removes virtual columns from inherited relation bindings", "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	duckdb::unique_ptr<QueryResult> result;
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE virtual_source(value INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO virtual_source VALUES (10), (20)"));
+	auto filtered = con.Table("virtual_source")->Filter("value > 0");
+	auto filtered_rowid = filtered->Project("virtual_source.rowid AS row_id")->Order("row_id");
+	REQUIRE_NOTHROW(result = filtered_rowid->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {0, 1}));
+
+	auto boundary = con.Table("virtual_source")->Distinct();
+
+	auto serialized = boundary->Project("virtual_source.value");
+	REQUIRE_FALSE(serialized->GetQuery().empty());
+	REQUIRE_NOTHROW(result = serialized->Execute());
+
+	REQUIRE_THROWS(boundary->Project("virtual_source.rowid AS row_id"));
+
+	auto rowid_filtered_boundary = con.Table("virtual_source")->Filter("rowid >= 0")->Distinct();
+	REQUIRE_NOTHROW(result = rowid_filtered_boundary->Project("value")->Order("value")->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {10, 20}));
+	REQUIRE_THROWS(rowid_filtered_boundary->Project("rowid"));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE named_rowid(rowid INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO named_rowid VALUES (10), (20)"));
+	auto named_rowid = con.Table("named_rowid")->Distinct()->Project("rowid")->Order("rowid");
+	REQUIRE_NOTHROW(result = named_rowid->Execute());
+	REQUIRE(CHECK_COLUMN(result, 0, {10, 20}));
 }

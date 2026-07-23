@@ -39,7 +39,6 @@ public:
 
 public:
 	unique_ptr<QueryNode> GetQueryNode() override;
-	unique_ptr<TableRef> GetTableRef() override;
 	BoundStatement Bind(Binder &binder) override;
 
 	const vector<ColumnDefinition> &Columns() override;
@@ -49,10 +48,28 @@ public:
 	void RemoveNamedParameterIfExists(const string &name);
 	void SetNamedParameters(named_parameter_map_t &&named_parameters);
 
-private:
-	void InitializeColumns();
+protected:
+	bool ContainsNonSQLRelation() override {
+		return input_relation && ChildContainsNonSQLRelation(*input_relation);
+	}
+	bool CanSerializeToQueryNodeInternal(Binder &binder) override {
+		return !input_relation || ChildCanSerializeToQueryNode(*input_relation, binder);
+	}
+	bool CanBindAsInputInternal(Binder &binder) override {
+		return !input_relation || ChildCanBindAsInput(*input_relation, binder);
+	}
+
+	unique_ptr<TableRef> GetTableRefInternal() override;
 
 private:
+	friend class SerializedExpressionScopeChecker;
+
+	void InitializeColumns();
+	void CaptureVirtualColumnNames(const LogicalOperator &plan);
+	BoundStatement BindAsInput(Binder &binder) override;
+
+private:
+	vector<string> virtual_column_names;
 	//! Whether or not to auto initialize the columns on construction
 	bool auto_initialize;
 };

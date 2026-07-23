@@ -45,6 +45,49 @@ def _execute_fresh_physical_plan(target, physical):
             pool.shutdown(kill=True)
 
 
+def test_qualified_join_projection_survives_logical_plan_pickle_to_fresh_connection():
+    source = duckdb.connect()
+    target = None
+    try:
+        left = source.sql("SELECT * FROM (VALUES (1), (2)) data(id)").set_alias("l")
+        right = source.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(id, value)").set_alias("r")
+        relation = left.join(right, "l.id = r.id").project("l.id AS id, r.value AS value").order("id")
+
+        target, physical, _ = _round_trip_to_fresh_physical_plan(relation)
+        table = _execute_fresh_physical_plan(target, physical)
+
+        assert table.column(0).to_pylist() == [1, 2]
+        assert table.column(1).to_pylist() == [10, 20]
+    finally:
+        if target is not None:
+            target.close()
+        source.close()
+
+
+def test_repartition_projection_survives_logical_plan_pickle_to_fresh_connection():
+    source = duckdb.connect()
+    target = None
+    try:
+        relation = (
+            source.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(id, value)")
+            .set_alias("source_data")
+            .repartition(2)
+            .project("source_data.id AS id, source_data.value + 1 AS value")
+            .order("id")
+        )
+
+        target, physical, _ = _round_trip_to_fresh_physical_plan(relation)
+        assert "Repartition" in physical.repr_ascii(False)
+        table = _execute_fresh_physical_plan(target, physical)
+
+        assert table.column(0).to_pylist() == [1, 2]
+        assert table.column(1).to_pylist() == [11, 21]
+    finally:
+        if target is not None:
+            target.close()
+        source.close()
+
+
 def test_attached_scalar_alias_survives_logical_plan_pickle_to_fresh_connection():
     source = vane.connect()
 
