@@ -22,7 +22,10 @@ from duckdb.runners.ray.fragment_registry import (
     _FTE_STATUS_WATCHERS,
 )
 from duckdb.runners.ray.fragment_worker_exchange import apply_exchange_selector_update
-from duckdb.runners.ray.fragment_worker_failures import mark_fte_worker_failed_for_event
+from duckdb.runners.ray.fragment_worker_failures import (
+    mark_fte_worker_failed_for_event,
+    quarantine_fte_worker,
+)
 from duckdb.runners.ray.fragment_worker_ordering import fragment_execution_key_for_fte_attempt
 from duckdb.runners.ray.fragment_worker_reservations import (
     fte_worker_reservation_event_state,
@@ -51,23 +54,40 @@ class FteWorkerEventHandlingMixin:
         self,
         failure: FteWorkerControlFailure,
     ) -> list[Any]:
-        query_id = failure.attempt_id.task_id.query_id
-        with _FTE_REGISTRY_LOCK:
-            if query_id in _FTE_CLOSING_QUERIES:
-                return []
-        scheduler = _FTE_SCHEDULERS.get(query_id)
-        if scheduler is None:
-            return []
-        self._bind_fte_scheduler_handlers(scheduler)
-        scheduler.enqueue(
-            WorkerFailed(
-                query_id,
-                failure.worker_id,
-                failure,
+        """Fence a failed worker before queued work can observe it as live."""
+
+        failed_worker_ids = quarantine_fte_worker(failure.worker_id)
+        query_ids = set(_FTE_SCHEDULERS.query_ids())
+        query_ids.add(failure.attempt_id.task_id.query_id)
+        schedulers = []
+        for query_id in sorted(query_ids):
+            with _FTE_REGISTRY_LOCK:
+                if query_id in _FTE_CLOSING_QUERIES:
+                    continue
+            scheduler = _FTE_SCHEDULERS.get(query_id)
+            if scheduler is None:
+                continue
+            self._bind_fte_scheduler_handlers(scheduler)
+            scheduler.enqueue(
+                WorkerFailed(
+                    query_id,
+                    failure.worker_id,
+                    failure,
+                    failed_worker_ids=failed_worker_ids,
+                ),
+                # Control failures happen inside an active drain.  Reconcile
+                # them before reservation completions already in that queue.
+                priority=True,
             )
-        )
-        scheduler.drain()
-        return []
+            schedulers.append(scheduler)
+
+        handles: list[Any] = []
+        for scheduler in schedulers:
+            try:
+                handles.extend(scheduler.drain())
+            except Exception as exc:
+                scheduler.fail(f"FTE worker failure handling failed: {exc}")
+        return handles
 
     def _handles_for_marked_fte_worker_failed(
         self,

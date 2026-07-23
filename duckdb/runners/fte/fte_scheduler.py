@@ -498,7 +498,7 @@ class FteQueryScheduler:
                 callbacks.append(registration.resume)
         self._run_task_source_callbacks(callbacks)
 
-    def enqueue(self, event: FteEvent) -> None:
+    def enqueue(self, event: FteEvent, *, priority: bool = False) -> None:
         if event.query_id != self.query_id:
             raise ValueError(f"event query_id {event.query_id!r} does not match scheduler {self.query_id!r}")
         callbacks: list[Callable[[], None]] = []
@@ -509,7 +509,10 @@ class FteQueryScheduler:
                 if event.execution_class in self._queued_internal_admission_classes:
                     return
                 self._queued_internal_admission_classes.add(event.execution_class)
-            self._events.append(event)
+            if priority:
+                self._events.appendleft(event)
+            else:
+                self._events.append(event)
             callbacks.extend(self._task_source_pause_callbacks_locked())
         self._run_task_source_callbacks(callbacks)
 

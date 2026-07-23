@@ -52,7 +52,6 @@ class FteWorkerCommandMixin:
         _bind_fte_scheduler_handlers: Any
         _fte_partition_owner: Any
         _fte_task_handle_cls: Any
-        _fte_worker_placement_manager: Any
 
     def _execute_fte_fragment_execution_worker_commands(
         self,
@@ -104,12 +103,15 @@ class FteWorkerCommandMixin:
                     )
                     raise fragment_execution.worker_control_failure_for_command(command, exc) from exc
                 if isinstance(command, FteCreateTaskCommand):
-                    self._fte_worker_placement_manager.release_reservation(
-                        query_id=command.query_id,
-                        fragment_id=command.fragment_id,
-                        partition_id=command.partition_id,
+                    command.worker.record_fte_task_started_from_reservation(
+                        command.query_id,
+                        command.fragment_id,
+                        command.partition_id,
+                        command.attempt_id,
+                        command.request,
                     )
-                fragment_execution.handle_worker_command_success(command)
+                else:
+                    fragment_execution.handle_worker_command_success(command)
                 _fte_command_debug_log(
                     "execute_command_done",
                     command_index=command_index,

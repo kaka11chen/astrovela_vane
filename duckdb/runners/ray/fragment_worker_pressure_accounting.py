@@ -149,6 +149,23 @@ class FteWorkerPressureAccountingMixin:
                 self._fte_pressure.memory_bytes_by_attempt.pop(key, None)
             self._fte_pressure.last_seen_at = time.time()
 
+    def record_fte_task_started_from_reservation(
+        self,
+        query_id: str,
+        fragment_id: str,
+        partition_id: int,
+        attempt_id: Any,
+        request: Mapping[str, Any],
+    ) -> None:
+        """Move reservation pressure to running without exposing free capacity."""
+
+        reservation_key = partition_reservation_key(query_id, fragment_id, partition_id)
+        with _FTE_REGISTRY_LOCK:
+            self._fte_pressure.reserved_partitions.discard(reservation_key)
+            self._fte_pressure.memory_bytes_by_reservation.pop(reservation_key, None)
+            self._fte_pressure.execution_class_by_reservation.pop(reservation_key, None)
+            self.record_fte_task_started(attempt_id, request)
+
     def record_fte_splits_added(self, attempt_id: Any, split_count: int) -> None:
         key = attempt_key(attempt_id)
         with _FTE_REGISTRY_LOCK:

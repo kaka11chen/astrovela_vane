@@ -9,12 +9,25 @@ from duckdb.runners.ray.fragment_registry import (
     _FTE_CLOSING_QUERIES,
     _FTE_REGISTRY_LOCK,
     _FTE_SCHEDULERS,
+    _FTE_WORKER_HANDLES,
 )
 from duckdb.runners.ray.fte_fragment_scheduler import (
     _expanded_fte_failed_worker_ids,
     _fte_retry_remaining_delay_s,
     _mark_fte_worker_failed,
 )
+
+
+def quarantine_fte_worker(worker_id: str) -> frozenset[str]:
+    """Make a failed worker ineligible before per-query reconciliation."""
+
+    failed_worker_ids = frozenset(_expanded_fte_failed_worker_ids(worker_id))
+    with _FTE_REGISTRY_LOCK:
+        for failed_worker_id in failed_worker_ids:
+            handle = _FTE_WORKER_HANDLES.get(failed_worker_id)
+            if handle is not None:
+                handle._fte_healthy = False
+    return failed_worker_ids
 
 
 def mark_fte_worker_failed_for_event(event: Any) -> list[tuple[str, str, list[Any], list[Any]]]:
@@ -27,7 +40,7 @@ def mark_fte_worker_failed_for_event(event: Any) -> list[tuple[str, str, list[An
     failed_worker_ids = (
         {str(item) for item in event.failed_worker_ids}
         if event.failed_worker_ids is not None
-        else _expanded_fte_failed_worker_ids(event.worker_id)
+        else set(quarantine_fte_worker(event.worker_id))
     )
     new_failed_worker_ids = scheduler.record_worker_failure(failed_worker_ids)
     if not new_failed_worker_ids:

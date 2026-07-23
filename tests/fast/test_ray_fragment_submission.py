@@ -2358,6 +2358,71 @@ def test_fte_owner_selection_uses_reserved_memory_pressure(monkeypatch):
     assert high_memory.fte_pressure_stats()["total_memory_bytes"] == 0
 
 
+def test_fte_create_promotes_reservation_to_running_atomically(monkeypatch):
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=15, worker_id="worker-0")
+    publish_started = threading.Event()
+    allow_publish = threading.Event()
+    query_b_started = threading.Event()
+    query_b_done = threading.Event()
+    errors = []
+    handles_by_query = {}
+    original_record_started = handle.record_fte_task_started
+
+    def record_started_with_barrier(attempt_id, request):
+        attempt = FteTaskAttemptId.coerce(attempt_id)
+        if attempt.task_id.query_id == "query-atomic-a":
+            publish_started.set()
+            if not allow_publish.wait(2.0):
+                raise RuntimeError("timed out waiting to publish running pressure")
+        return original_record_started(attempt_id, request)
+
+    monkeypatch.setattr(handle, "record_fte_task_started", record_started_with_barrier)
+
+    def submit(query_id, node_id):
+        try:
+            if query_id == "query-atomic-b":
+                query_b_started.set()
+            handles_by_query[query_id] = handle.submit_tasks(
+                [
+                    _FakeTask(
+                        name=f"scan-{query_id}",
+                        context={"query_id": query_id, "node_id": node_id},
+                        inputs={node_id: {"kind": "scan_task", "data": query_id.encode()}},
+                    )
+                ]
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            if query_id == "query-atomic-b":
+                query_b_done.set()
+
+    thread_a = threading.Thread(target=submit, args=("query-atomic-a", "7"))
+    thread_b = threading.Thread(target=submit, args=("query-atomic-b", "8"))
+    thread_a.start()
+    try:
+        assert publish_started.wait(2.0)
+        thread_b.start()
+        assert query_b_started.wait(2.0)
+        query_b_completed_during_handoff = query_b_done.wait(0.1)
+    finally:
+        allow_publish.set()
+        thread_a.join(2.0)
+        if thread_b.ident is not None:
+            thread_b.join(2.0)
+
+    assert thread_a.is_alive() is False
+    assert thread_b.is_alive() is False
+    assert errors == []
+    assert query_b_completed_during_handoff is False
+    assert [str(item.task_id) for item in handles_by_query["query-atomic-a"]] == ["query-atomic-a.0.0.0"]
+    assert handles_by_query["query-atomic-b"] == []
+    create_requests = _create_requests(actor)
+    assert [request["task_id"]["query_id"] for request in create_requests] == ["query-atomic-a"]
+    assert handle.fte_pressure_stats()["total_memory_bytes"] == 10
+
+
 def test_ray_worker_handle_requires_positive_ray_memory_capacity():
     actor = _FakeActor()
 
@@ -4704,6 +4769,85 @@ def test_fte_split_append_control_failure_replays_on_replacement(monkeypatch):
         "WorkerReservationCompleted": 2,
         "WorkerFailed": 1,
     }
+
+
+def test_fte_control_failure_preempts_queued_work_across_queries(monkeypatch):
+    monkeypatch.setattr(
+        RayWorkerActorHandle,
+        "_fte_task_handle_cls",
+        staticmethod(lambda: _FakeFteTaskHandle),
+    )
+
+    class _FailFirstCreateActor(_FakeActor):
+        failed = False
+
+        def _fte_create_task(self, request):
+            self.fte_calls.append(("create", request))
+            if request["task_id"]["query_id"] == "query-control-barrier" and not self.failed:
+                self.failed = True
+                replacement._fte_healthy = True
+                raise RuntimeError("planned first create failure")
+            return self._control_status("fte_create_task", request["task_id"])
+
+    actor = _FailFirstCreateActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60, worker_id="worker-0")
+    replacement_actor = _FakeActor()
+    replacement = RayWorkerActorHandle(
+        replacement_actor,
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-1",
+    )
+    replacement._fte_healthy = False
+    other_handles = handle.submit_tasks(
+        [
+            _FakeTask(
+                name="scan-other",
+                context={"query_id": "query-control-other", "node_id": "6"},
+                inputs={"6": {"kind": "scan_task", "data": b"other"}},
+            )
+        ]
+    )
+    tasks = [
+        _FakeTask(
+            name="scan-a",
+            context={"query_id": "query-control-barrier", "node_id": "7"},
+            inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        ),
+        _FakeTask(
+            name="scan-b",
+            context={"query_id": "query-control-barrier", "node_id": "8"},
+            inputs={"8": {"kind": "scan_task", "data": b"b"}},
+        ),
+    ]
+
+    handles = handle.submit_tasks(tasks)
+
+    assert len(other_handles) == 1
+    assert other_handles[0].worker_handle is handle
+    assert len(handles) == 3
+    assert all(task_handle.worker_handle is replacement for task_handle in handles)
+    assert [str(FteTaskAttemptId.coerce(request["task_id"])) for request in _create_requests(actor)] == [
+        "query-control-other.0.0.0",
+        "query-control-barrier.0.0.0",
+    ]
+    assert [str(FteTaskAttemptId.coerce(request["task_id"])) for request in _create_requests(replacement_actor)] == [
+        "query-control-other.0.0.1",
+        "query-control-barrier.0.0.1",
+        "query-control-barrier.1.0.0",
+    ]
+    assert handle._fte_healthy is False
+    assert "worker-0" not in worker_handle_mod._FTE_WORKER_HANDLES
+    query_owners = {
+        key: owner
+        for key, owner in worker_handle_mod._FTE_PARTITION_OWNERS.items()
+        if key[0] in {"query-control-barrier", "query-control-other"}
+    }
+    assert set(query_owners) == {
+        ("query-control-barrier", "query-control-barrier:node:7", 0),
+        ("query-control-barrier", "query-control-barrier:node:8", 0),
+        ("query-control-other", "query-control-other:node:6", 0),
+    }
+    assert all(owner is replacement for owner in query_owners.values())
 
 
 def test_fte_split_queue_full_replays_descriptor_on_replacement(monkeypatch):
