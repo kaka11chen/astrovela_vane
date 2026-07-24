@@ -440,6 +440,7 @@ def test_ray_scan_filter_projection(ray_runner, duckdb_conn, parquet_path):
     )
 
 
+@pytest.mark.gpu
 def test_ray_vllm_distributed(ray_runner, duckdb_conn):
     pytest.importorskip("pyarrow")
     try:
@@ -688,6 +689,7 @@ def test_ray_udf_lazy_output_defaults_to_enabled(duckdb_conn):
     assert "ray_block_stream_output" in plan
 
 
+@pytest.mark.gpu
 def test_ray_udf_lazy_output_input_passthrough_distributed(ray_runner, duckdb_conn, tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
@@ -749,6 +751,7 @@ def test_ray_udf_lazy_output_input_passthrough_distributed(ray_runner, duckdb_co
     assert set(rows) == {("11",), ("21",), ("31",), ("41",)}
 
 
+@pytest.mark.gpu
 def test_ray_udf_lazy_output_projection_limit_passthrough_distributed(ray_runner, duckdb_conn, tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
@@ -819,6 +822,7 @@ def test_ray_udf_lazy_output_projection_limit_passthrough_distributed(ray_runner
     assert set(rows).issubset({("11",), ("22",), ("33",), ("44",)})
 
 
+@pytest.mark.gpu
 def test_ray_udf_lazy_output_local_exchange_passthrough_distributed(ray_runner, duckdb_conn, tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
@@ -927,6 +931,10 @@ def test_ray_udf_lazy_output_filter_materialize_distributed(ray_runner, duckdb_c
         schema={"id": duckdb.sqltype("INTEGER"), "score": duckdb.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
+        # This test exercises the two-pool materialization boundary, not
+        # CPU saturation. Fractional actors keep both pools plus the parent
+        # FTE slot schedulable on the standard four-core CI runner.
+        cpus=0.5,
         gpus=0.0,
         batch_size=2,
     )
@@ -935,6 +943,7 @@ def test_ray_udf_lazy_output_filter_materialize_distributed(ray_runner, duckdb_c
         schema={"combined": duckdb.sqltype("INTEGER")},
         execution_backend="ray_actor",
         actor_number=2,
+        cpus=0.5,
         gpus=0.0,
         batch_size=2,
     )
@@ -993,6 +1002,7 @@ def test_ray_udf_lazy_output_budget_plan(duckdb_conn):
     assert plan.count("ray_block_stream_output") == 2
 
 
+@pytest.mark.gpu
 def test_ray_udf_direct_output_lease_lifetime(ray_runner, duckdb_conn, tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
@@ -1242,6 +1252,7 @@ def test_ray_udf_lazy_streaming_producer_plan(duckdb_conn):
     assert "ray_block_stream_output" in plan
 
 
+@pytest.mark.gpu
 def test_ray_udf_lazy_streaming_producer_yields_ref_bundles(ray_runner, duckdb_conn, tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
@@ -2511,6 +2522,7 @@ def test_ray_task_flat_map_ref_stream_all_empty_output_finishes(tmp_path, ray_su
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.gpu
 def test_ray_python_udf_task_consumes_and_emits_ref_bundles_distributed(ray_runner, duckdb_conn, tmp_path, monkeypatch):
     pytest.importorskip("pyarrow")
     import pyarrow as pa

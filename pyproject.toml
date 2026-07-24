@@ -389,6 +389,7 @@ test = [ # dependencies used for running tests
     "gcovr",
     "gcsfs; sys_platform != 'win32' or platform_machine != 'ARM64'",
     "packaging",
+    "pillow",
     "polars",
     "psutil",
     "py4j",
@@ -463,6 +464,7 @@ testpaths = ["tests"]
 pythonpath = ["tests", "tests/fast"]
 markers = [
     "external_service: tests that require an externally provisioned service",
+    "gpu: tests that require CUDA-capable GPU hardware",
     "real_ray: tests that connect to or own a real Ray runtime",
     "ray_cluster_owner: tests that must own a Ray cluster in an isolated pytest process",
     "ray_fault: tests that intentionally kill or restart Ray runtime components",
