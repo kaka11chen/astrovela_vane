@@ -213,6 +213,22 @@ def _fte_worker_task_manager(
     )
 
 
+async def _wait_for_terminal_task_status(manager, task_id, initial_status):
+    status = initial_status
+    while status["state"] not in {
+        FteTaskState.FINISHED.value,
+        FteTaskState.FAILED.value,
+        FteTaskState.CANCELED.value,
+        FteTaskState.ABORTED.value,
+    }:
+        status = await manager.wait_task_status(
+            task_id,
+            min_version=status["version"],
+            timeout_s=1.0,
+        )
+    return status
+
+
 def _register_fte_query(query_id: str, node_id: str, *, partitions: int, task_slots: int):
     stage_id = f"stage:{query_id}:node:{node_id}:fte"
     graph = QueryExecutionGraph(
@@ -3791,6 +3807,122 @@ def test_fte_worker_task_manager_unknown_status_is_non_throwing():
         assert status["task_id_string"] == "q.9.3.0"
         with pytest.raises(KeyError, match="unknown FTE task attempt"):
             await manager.add_splits(task_id, "7", [])
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "failure_message"),
+    [
+        ("file_stat", "planned output file stat failure"),
+        ("integer_conversion", "invalid literal for int"),
+        ("split_queue_status", "planned split queue status failure"),
+        ("finished_transition", "planned FINISHED transition failure"),
+    ],
+)
+def test_fte_worker_task_manager_finalization_failure_is_terminal_and_releases_slot(
+    monkeypatch,
+    tmp_path,
+    failure_point,
+    failure_message,
+):
+    first_task_id = "q-finalize.0.0.0"
+    second_task_id = "q-finalize.0.1.0"
+    output_dir = tmp_path / "attempt"
+    output_dir.mkdir()
+    output_file = output_dir / "partition_0_data.arrow"
+    output_file.write_bytes(b"payload")
+
+    async def execute_fn(request):
+        task_id = str(FteTaskAttemptId.coerce(request["task_id"]))
+        if task_id == first_task_id and failure_point == "integer_conversion":
+            return ([], [{"num_rows": "not-an-integer", "size_bytes": 1}], None, [])
+        return {"ok": task_id}
+
+    async def run():
+        manager = _fte_worker_task_manager(execute_fn, max_running_tasks=1)
+        first_request = {
+            "task_id": first_task_id,
+            "fragment_id": "q-finalize:node:scan",
+        }
+        if failure_point == "file_stat":
+            first_request["exchange_sink_instance"] = {"attempt_path": str(output_dir)}
+
+        first_initial = await manager.create_task(first_request)
+        first_execution = manager.tasks[first_task_id]
+        original_complete_dynamic_source_splits = first_execution._complete_dynamic_source_splits
+        complete_dynamic_source_splits_calls = 0
+
+        def track_complete_dynamic_source_splits():
+            nonlocal complete_dynamic_source_splits_calls
+            complete_dynamic_source_splits_calls += 1
+            original_complete_dynamic_source_splits()
+
+        monkeypatch.setattr(
+            first_execution,
+            "_complete_dynamic_source_splits",
+            track_complete_dynamic_source_splits,
+        )
+
+        if failure_point == "file_stat":
+            original_stat = Path.stat
+
+            def fail_output_file_stat(path, *args, **kwargs):
+                if path == output_file:
+                    raise RuntimeError(failure_message)
+                return original_stat(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "stat", fail_output_file_stat)
+        elif failure_point == "split_queue_status":
+            original_split_queue_status = first_execution.split_queue_status
+            injected = False
+
+            def fail_split_queue_status_once():
+                nonlocal injected
+                if not injected:
+                    injected = True
+                    raise RuntimeError(failure_message)
+                return original_split_queue_status()
+
+            monkeypatch.setattr(first_execution, "split_queue_status", fail_split_queue_status_once)
+        elif failure_point == "finished_transition":
+            original_transition = first_execution._transition
+
+            def fail_finished_transition(state, *, failure=None):
+                if state == FteTaskState.FINISHED:
+                    raise RuntimeError(failure_message)
+                return original_transition(state, failure=failure)
+
+            monkeypatch.setattr(first_execution, "_transition", fail_finished_transition)
+
+        second_initial = await manager.create_task(
+            {
+                "task_id": second_task_id,
+                "fragment_id": "q-finalize:node:scan",
+            }
+        )
+        assert second_initial["state"] == FteTaskState.QUEUED.value
+
+        first_terminal = await asyncio.wait_for(
+            _wait_for_terminal_task_status(manager, first_task_id, first_initial),
+            timeout=2.0,
+        )
+        assert first_terminal["state"] == FteTaskState.FAILED.value
+        assert first_terminal["failure"]["message"].startswith(failure_message)
+        assert complete_dynamic_source_splits_calls == 1
+        assert first_execution.result is None
+
+        second_terminal = await asyncio.wait_for(
+            _wait_for_terminal_task_status(manager, second_task_id, second_initial),
+            timeout=2.0,
+        )
+        assert second_terminal["state"] == FteTaskState.FINISHED.value
+        assert first_task_id not in manager.running_tasks
+
+        assert manager.release_task_result(first_task_id)["state"] == FteTaskState.FAILED.value
+        assert manager.release_task_result(first_task_id)["state"] == FteTaskState.FAILED.value
+        assert await manager.drop_query("q-finalize") == {"removed": 2, "canceled": 0}
+        assert await manager.drop_query("q-finalize") == {"removed": 0, "canceled": 0}
 
     asyncio.run(run())
 

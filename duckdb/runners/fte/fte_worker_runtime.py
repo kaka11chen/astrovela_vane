@@ -580,6 +580,8 @@ class FteTaskExecution:
             self._future.add_done_callback(callback)
 
     async def _run(self) -> None:
+        result_stored = False
+        dynamic_source_splits_completed = False
         try:
             if self.fte_runtime:
                 await self._wait_for_fte_splits_sealed()
@@ -595,23 +597,33 @@ class FteTaskExecution:
             result = await self.execute_fn(self.request)
             with self._status_lock:
                 self.result = result
+                result_stored = True
                 self._result_stored_at = time.time()
+            self._complete_dynamic_source_splits()
+            dynamic_source_splits_completed = True
             self._log_result_lifecycle("result_stored", result=result)
-        except asyncio.CancelledError:
-            self._transition(FteTaskState.CANCELED)
-            raise
-        except Exception as exc:
-            self._transition(FteTaskState.FAILED, failure=_failure_payload(exc))
-        else:
-            result = self.result
             with self._status_lock:
                 self.status.output_stats = self._extract_output_stats(result)
-            self._complete_dynamic_source_splits()
             final_task_stats = self._extract_task_stats(result)
             final_split_stats = self.split_queue_status()
             if final_task_stats or final_split_stats:
                 self._record_task_stats({**final_task_stats, **final_split_stats})
             self._transition(FteTaskState.FINISHED)
+        except asyncio.CancelledError:
+            self._transition(FteTaskState.CANCELED)
+            raise
+        except Exception as exc:
+            if result_stored and not dynamic_source_splits_completed:
+                try:
+                    self._complete_dynamic_source_splits()
+                except Exception:
+                    pass
+            if result_stored:
+                try:
+                    self.release_result(reason="task_failed")
+                except Exception:
+                    pass
+            self._transition(FteTaskState.FAILED, failure=_failure_payload(exc))
 
     def _complete_dynamic_source_splits(self) -> None:
         queues = [
