@@ -14,6 +14,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from duckdb.runners.fte.debug_memory import (
+    debug_flag_enabled,
+    describe_result_payload,
+    log_debug,
+    process_memory_snapshot,
+)
 from duckdb.runners.fte.fte_config import (
     FTE_WORKER_RUNTIME,
     FteWorkerAdmissionConfig,
@@ -30,12 +36,6 @@ from duckdb.runners.fte.fte_descriptor import (
 from duckdb.runners.fte.fte_exchange import collect_spooling_output_stats
 from duckdb.runners.fte.fte_state import _TERMINAL_STATES, FteTaskState
 from duckdb.runners.fte.fte_types import FteSplit, FteTaskAttemptId
-from duckdb.runners.fte.debug_memory import (
-    debug_flag_enabled,
-    describe_result_payload,
-    log_debug,
-    process_memory_snapshot,
-)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -259,7 +259,7 @@ class FteTaskExecution:
         request: Mapping[str, Any],
         execute_fn: Callable[[Mapping[str, Any]], Awaitable[Any]],
         *,
-        status_callback: Callable[["FteTaskExecution"], None] | None = None,
+        status_callback: Callable[["FteTaskExecution"], object] | None = None,
         require_query_task_lease: bool = False,
         default_task_memory_bytes: int | None = None,
     ) -> None:
@@ -847,23 +847,25 @@ class FteTaskExecution:
 
         if update_request.source_node_ids:
             current = {str(source) for source in (self.request.get("source_node_ids") or [])}
-            merged = current | set(update_request.source_node_ids)
-            if merged != current:
-                self.request["source_node_ids"] = sorted(merged)
+            merged_source_node_ids = current | set(update_request.source_node_ids)
+            if merged_source_node_ids != current:
+                self.request["source_node_ids"] = sorted(merged_source_node_ids)
                 changed = True
         if update_request.dynamic_scan_source_node_ids:
-            merged = self.dynamic_scan_source_ids | set(update_request.dynamic_scan_source_node_ids)
-            if merged != self.dynamic_scan_source_ids:
-                self.dynamic_scan_source_ids = merged
-                self._add_dynamic_source_queues("scan_task", merged)
-                self.request["dynamic_scan_source_node_ids"] = sorted(merged)
+            merged_scan_source_ids = self.dynamic_scan_source_ids | set(update_request.dynamic_scan_source_node_ids)
+            if merged_scan_source_ids != self.dynamic_scan_source_ids:
+                self.dynamic_scan_source_ids = merged_scan_source_ids
+                self._add_dynamic_source_queues("scan_task", merged_scan_source_ids)
+                self.request["dynamic_scan_source_node_ids"] = sorted(merged_scan_source_ids)
                 changed = True
         if update_request.dynamic_exchange_source_node_ids:
-            merged = self.dynamic_exchange_source_ids | set(update_request.dynamic_exchange_source_node_ids)
-            if merged != self.dynamic_exchange_source_ids:
-                self.dynamic_exchange_source_ids = merged
-                self._add_dynamic_source_queues("exchange_source_task", merged)
-                self.request["dynamic_exchange_source_node_ids"] = sorted(merged)
+            merged_exchange_source_ids = self.dynamic_exchange_source_ids | set(
+                update_request.dynamic_exchange_source_node_ids
+            )
+            if merged_exchange_source_ids != self.dynamic_exchange_source_ids:
+                self.dynamic_exchange_source_ids = merged_exchange_source_ids
+                self._add_dynamic_source_queues("exchange_source_task", merged_exchange_source_ids)
+                self.request["dynamic_exchange_source_node_ids"] = sorted(merged_exchange_source_ids)
                 changed = True
 
         for source_id, splits in update_request.initial_splits.items():
@@ -889,11 +891,11 @@ class FteTaskExecution:
                 self.request["output_buffers"] = dict(output_buffers or {})
                 changed = True
         if update_request.dynamic_filter_domains:
-            merged = dict(self.dynamic_filter_domains)
-            merged.update(update_request.dynamic_filter_domains)
-            if merged != self.dynamic_filter_domains:
-                self.dynamic_filter_domains = merged
-                self.request["dynamic_filter_domains"] = dict(merged)
+            merged_dynamic_filter_domains = dict(self.dynamic_filter_domains)
+            merged_dynamic_filter_domains.update(update_request.dynamic_filter_domains)
+            if merged_dynamic_filter_domains != self.dynamic_filter_domains:
+                self.dynamic_filter_domains = merged_dynamic_filter_domains
+                self.request["dynamic_filter_domains"] = dict(merged_dynamic_filter_domains)
                 changed = True
 
         if changed:
@@ -1142,7 +1144,11 @@ class FteWorkerTaskManager:
         execution.start()
         self._publish_status(execution)
         self._admission_debug_log("start_task", execution, reason=reason)
-        execution.add_done_callback(lambda future, task_key=key: self._task_done(task_key, future))
+
+        def task_done(future: asyncio.Task[Any]) -> None:
+            self._task_done(key, future)
+
+        execution.add_done_callback(task_done)
 
     def _task_done(self, task_key: str, _future: asyncio.Task[Any]) -> None:
         self.running_tasks.discard(task_key)
@@ -1222,12 +1228,12 @@ class FteWorkerTaskManager:
         key = self._key(task_id)
         execution = self.tasks.get(key)
         if execution is not None:
-            status = self._publish_status(execution)
-            status.pop("result", None)
-            return status
-        status = self._dropped_status(task_id)
-        if status is not None:
-            updated = dict(status)
+            published_status = self._publish_status(execution)
+            published_status.pop("result", None)
+            return published_status
+        dropped_status = self._dropped_status(task_id)
+        if dropped_status is not None:
+            updated = dict(dropped_status)
             updated.pop("result", None)
             return updated
         return self._unknown_status(task_id)
@@ -1237,12 +1243,12 @@ class FteWorkerTaskManager:
         execution = self.tasks.get(key)
         if execution is not None:
             execution.release_result(reason="release_task_result")
-            status = self._publish_status(execution)
-            status.pop("result", None)
-            return status
-        status = self._dropped_status(task_id)
-        if status is not None:
-            updated = dict(status)
+            published_status = self._publish_status(execution)
+            published_status.pop("result", None)
+            return published_status
+        dropped_status = self._dropped_status(task_id)
+        if dropped_status is not None:
+            updated = dict(dropped_status)
             updated.pop("result", None)
             self._store_dropped_status(key, updated)
             return updated
