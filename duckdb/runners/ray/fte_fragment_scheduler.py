@@ -8,7 +8,7 @@ import hashlib
 import math
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from duckdb.runners.fte import (
@@ -222,10 +222,11 @@ def _normalize_exchange_selector_selected(
     selected: dict[int, dict[str, Any]] = {}
     if not selected_payload:
         return selected
+    items: Iterable[tuple[Any, Any]]
     if isinstance(selected_payload, Mapping):
         items = selected_payload.items()
     elif isinstance(selected_payload, (list, tuple)):
-        normalized_items = []
+        normalized_items: list[tuple[Any, Any]] = []
         for entry in selected_payload:
             if not isinstance(entry, Mapping):
                 raise ValueError("exchange selector selected list entries must be mappings")
@@ -626,6 +627,10 @@ def quiesce_fte_registry_for_query(query_id: str) -> None:
                     f"{_FTE_ACTIVE_OPERATIONS_BY_QUERY.get(query_key, 0)}"
                 )
             _FTE_REGISTRY_CONDITION.wait(remaining)
+    # An operation admitted before close may publish its watcher while the
+    # first join is running.  No new operation can start after close, so this
+    # second pass is the final watcher ownership cut.
+    _stop_fte_status_watchers(query_key)
 
 
 def open_fte_registry_for_query(query_id: str) -> None:
@@ -785,6 +790,10 @@ def _drop_fte_registry_for_query(query_id: str) -> None:
         return
     quiesce_fte_registry_for_query(query_id)
     FteWorkerPlacementManager.release_query(query_id)
+    # Query-resource and reservation capacity may already be visible.  Signal
+    # before the remaining local cleanup so a later teardown error cannot
+    # strand unrelated queries.
+    request_fte_pending_task_drain()
     pending_worker_reservation_futures: list[FteWorkerReservationFuture] = []
     worker_handles: list[Any] = []
     with _FTE_REGISTRY_LOCK:
@@ -821,19 +830,84 @@ def _drop_fte_registry_for_query(query_id: str) -> None:
         worker_handles = [handle for handle in _FTE_WORKER_HANDLES.values() if handle is not None]
         _FTE_REGISTRY_CONDITION.notify_all()
     _FTE_SCHEDULERS.drop_query(query_id)
-    for handle in worker_handles:
-        handle._drop_fte_state_for_query(query_id)
+    try:
+        for handle in worker_handles:
+            handle._drop_fte_state_for_query(query_id)
+    finally:
+        # Worker-local running pressure is released by the cleanup above, not
+        # by release_query().  Keep this wake in a finally block so partial
+        # cleanup cannot strand capacity either.
+        request_fte_pending_task_drain()
     for future in pending_worker_reservation_futures:
         future.cancel()
 
 
-def _store_fte_result_handles(query_id: str, handles: list[Any]) -> None:
+def _store_fte_result_handles(
+    query_id: str,
+    handles: list[Any],
+    *,
+    registry_operation_owned: bool = False,
+) -> None:
     if not handles:
         return
     with _FTE_REGISTRY_LOCK:
-        if str(query_id) in _FTE_CLOSING_QUERIES:
+        if not registry_operation_owned and str(query_id) in _FTE_CLOSING_QUERIES:
             raise RuntimeError(f"FTE query registry is closing: {query_id}")
         _FTE_RESULT_HANDLES_BY_QUERY.setdefault(str(query_id), []).extend(handles)
+
+
+def request_fte_pending_task_drain() -> list[Any]:
+    """Signal and, when elected leader, run the single-flight admission pump."""
+    from duckdb.runners.fte.fte_events import ResourceAdmissionChanged
+
+    def drain_query(
+        query_id: str,
+        execution_class: FteTaskExecutionClass,
+    ) -> list[Any]:
+        if not begin_fte_registry_operation(query_id):
+            return []
+        try:
+            scheduler = _FTE_SCHEDULERS.get(query_id)
+            if scheduler is None:
+                return []
+            scheduler.enqueue(
+                ResourceAdmissionChanged(
+                    query_id,
+                    execution_class=execution_class.value,
+                    internal=True,
+                )
+            )
+            return scheduler.drain()
+        finally:
+            end_fte_registry_operation(query_id)
+
+    def drain_round(query_ids: list[str]) -> list[Any]:
+        handles: list[Any] = []
+
+        def drain_execution_class(execution_class: FteTaskExecutionClass) -> None:
+            for query_id in query_ids:
+                scheduler = _FTE_SCHEDULERS.get(query_id)
+                if scheduler is None or scheduler.stats().state != "RUNNING":
+                    continue
+                try:
+                    handles.extend(drain_query(query_id, execution_class))
+                except Exception as exc:
+                    scheduler.fail(f"FTE admission failed: {exc}")
+
+        drain_execution_class(FteTaskExecutionClass.EAGER_SPECULATIVE)
+        drain_execution_class(FteTaskExecutionClass.STANDARD)
+        with _FTE_REGISTRY_LOCK:
+            candidate_fragment_execution_items = [
+                (key, fragment_execution)
+                for key, fragment_execution in _FTE_FRAGMENT_EXECUTIONS.items()
+                if key[0] not in _FTE_CLOSING_QUERIES
+                and callable(getattr(fragment_execution, "has_pending_partitions", None))
+            ]
+        if not _has_fte_pending_standard_partitions_for_active_queries(candidate_fragment_execution_items):
+            drain_execution_class(FteTaskExecutionClass.SPECULATIVE)
+        return handles
+
+    return _FTE_SCHEDULERS.run_pending_drain(drain_round)
 
 
 def _fte_execution_queries_waiting_for_resource(
@@ -857,12 +931,24 @@ def _fte_execution_queries_waiting_for_resource(
     for (execution_query_id, _fragment_id), fragment_execution in fragment_execution_items:
         if execution_query_id in closing_queries:
             continue
-        owner_query_id, _stage_id = resource_identity_from_context(fragment_execution.context)
-        if owner_query_id != resource_query_key:
+        scheduler = _FTE_SCHEDULERS.get(execution_query_id)
+        if scheduler is None or scheduler.stats().state != "RUNNING":
             continue
-        if fragment_execution.has_pending_partitions():
+        try:
+            owner_query_id, _stage_id = resource_identity_from_context(fragment_execution.context)
+            if owner_query_id != resource_query_key:
+                continue
+            has_pending_partitions = fragment_execution.has_pending_partitions()
+        except Exception as exc:
+            scheduler.fail(f"FTE resource admission scan failed: {exc}")
+            continue
+        if has_pending_partitions:
             execution_query_ids.add(execution_query_id)
-    return tuple(sorted(execution_query_ids))
+    return tuple(
+        query_id
+        for query_id in sorted(execution_query_ids)
+        if (scheduler := _FTE_SCHEDULERS.get(query_id)) is not None and scheduler.stats().state == "RUNNING"
+    )
 
 
 def drain_fte_resource_admission_change(query_id: str) -> list[Any]:
@@ -873,16 +959,9 @@ def drain_fte_resource_admission_change(query_id: str) -> list[Any]:
     concurrent status/event drain either handles this event or leaves it queued
     for the active drainer.
     """
-    from duckdb.runners.fte.fte_events import ResourceAdmissionChanged
-
-    handles: list[Any] = []
-    for execution_query_id in _fte_execution_queries_waiting_for_resource(query_id):
-        scheduler = _FTE_SCHEDULERS.get(execution_query_id)
-        if scheduler is None:
-            continue
-        scheduler.enqueue(ResourceAdmissionChanged(execution_query_id))
-        handles.extend(scheduler.drain())
-    return handles
+    if not _fte_execution_queries_waiting_for_resource(query_id):
+        return []
+    return request_fte_pending_task_drain()
 
 
 def has_fte_resource_admission_waiter(query_id: str) -> bool:
@@ -1573,11 +1652,32 @@ def _has_replacement_fte_worker(
     )
 
 
+# FTE lock hierarchy:
+# 1. Scheduler and registry locks protect queues/snapshots only and are released
+#    before fragment state is inspected.
+# 2. A thread may hold one fragment state lock at a time.
+# 3. Global fragment traversal runs with no fragment state lock held.
+def _assert_no_fte_fragment_state_lock_held(
+    fragment_execution_items: list[tuple[tuple[str, str], FteFragmentExecution]],
+) -> None:
+    if not __debug__:
+        return
+    held_keys = [
+        key
+        for key, fragment_execution in fragment_execution_items
+        if fragment_execution._state_lock_owned_by_current_thread()
+    ]
+    assert not held_keys, (
+        f"FTE lock hierarchy violation: global fragment traversal while holding a fragment state lock: {held_keys}"
+    )
+
+
 def _ordered_fte_fragment_execution_items_for_pending_drain(
     fragment_execution_items: list[tuple[tuple[str, str], FteFragmentExecution]],
     *,
     execution_class: FteTaskExecutionClass | str | None = None,
 ) -> list[tuple[tuple[str, str], FteFragmentExecution]]:
+    _assert_no_fte_fragment_state_lock_held(fragment_execution_items)
     if not fragment_execution_items:
         return []
     if execution_class is not None:
@@ -1605,10 +1705,28 @@ def _ordered_fte_fragment_execution_items_for_pending_drain(
 def _has_fte_pending_standard_partitions(
     fragment_execution_items: list[tuple[tuple[str, str], FteFragmentExecution]],
 ) -> bool:
+    _assert_no_fte_fragment_state_lock_held(fragment_execution_items)
     return any(
         fragment_execution.has_pending_partitions(FteTaskExecutionClass.STANDARD)
         for _, fragment_execution in fragment_execution_items
     )
+
+
+def _has_fte_pending_standard_partitions_for_active_queries(
+    fragment_execution_items: list[tuple[tuple[str, str], FteFragmentExecution]],
+) -> bool:
+    """Keep another query's admission scan failure local to that query."""
+    _assert_no_fte_fragment_state_lock_held(fragment_execution_items)
+    for key, fragment_execution in fragment_execution_items:
+        scheduler = _FTE_SCHEDULERS.get(key[0])
+        if scheduler is None or scheduler.stats().state != "RUNNING":
+            continue
+        try:
+            if fragment_execution.has_pending_partitions(FteTaskExecutionClass.STANDARD):
+                return True
+        except Exception as exc:
+            scheduler.fail(f"FTE admission scan failed: {exc}")
+    return False
 
 
 def _admit_fte_partition_execution_ready(
@@ -1635,11 +1753,14 @@ def _admit_fte_partition_node_wait(
     if fragment_execution is not None:
         _sync_write_sink_stage_for_fragment(fragment_execution)
     with _FTE_REGISTRY_LOCK:
-        fragment_execution_items = list(_FTE_FRAGMENT_EXECUTIONS.items())
+        fragment_execution_items = [
+            item for item in _FTE_FRAGMENT_EXECUTIONS.items() if item[0][0] not in _FTE_CLOSING_QUERIES
+        ]
     if partition.node_wait_started_at is None:
         execution_class = FteTaskExecutionClass.coerce(partition.execution_class)
-        if execution_class == FteTaskExecutionClass.SPECULATIVE and _has_fte_pending_standard_partitions(
-            fragment_execution_items
+        if (
+            execution_class == FteTaskExecutionClass.SPECULATIVE
+            and _has_fte_pending_standard_partitions_for_active_queries(fragment_execution_items)
         ):
             return False
     if fragment_execution is None:
@@ -2223,6 +2344,7 @@ def _mark_fte_worker_failed(
                 error or f"FTE worker lost: {failed_worker_id}",
                 retryable=True,
                 retryable_by_partition_id=retryable_by_partition_id,
+                schedule_retries=False,
             )
             if scheduled:
                 scheduled_by_stage.append((query_id, fragment_id, scheduled, []))
@@ -2789,7 +2911,7 @@ def refresh_fte_running_task_stats(query_id: str | None = None) -> None:
                 validate_fte_status_identity(status, running.attempt_id)
                 if fte_registry_query_is_closing(fragment_execution.query_id):
                     continue
-                fragment_execution.handle_task_status(status)
+                running.remote_handle.handle_fte_task_status(status)
             except Exception:
                 pass
 

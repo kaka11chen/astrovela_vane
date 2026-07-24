@@ -6,6 +6,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Any
 
+from duckdb.runners.fte import FteTaskAttemptId, FteTaskExecutionClass
 from duckdb.runners.ray.fragment_registry import _FTE_REGISTRY_LOCK
 from duckdb.runners.ray.fragment_worker_pressure import (
     attempt_key,
@@ -13,14 +14,21 @@ from duckdb.runners.ray.fragment_worker_pressure import (
     initial_split_count,
     partition_reservation_key,
 )
-from duckdb.runners.fte import FteTaskAttemptId, FteTaskExecutionClass
-from duckdb.runners.ray.fte_fragment_scheduler import _memory_requirement_bytes
+from duckdb.runners.ray.fte_fragment_scheduler import (
+    _memory_requirement_bytes,
+    request_fte_pending_task_drain,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
 
 class FteWorkerPressureAccountingMixin:
+    if TYPE_CHECKING:
+        # Supplied by the composed Ray worker handle.
+        _fte_pressure: Any
+        _drain_fte_pending_tasks: Any
+
     def finish_fte_task_with_outputs(
         self,
         attempt_id: Any,
@@ -141,6 +149,23 @@ class FteWorkerPressureAccountingMixin:
                 self._fte_pressure.memory_bytes_by_attempt.pop(key, None)
             self._fte_pressure.last_seen_at = time.time()
 
+    def record_fte_task_started_from_reservation(
+        self,
+        query_id: str,
+        fragment_id: str,
+        partition_id: int,
+        attempt_id: Any,
+        request: Mapping[str, Any],
+    ) -> None:
+        """Move reservation pressure to running without exposing free capacity."""
+
+        reservation_key = partition_reservation_key(query_id, fragment_id, partition_id)
+        with _FTE_REGISTRY_LOCK:
+            self._fte_pressure.reserved_partitions.discard(reservation_key)
+            self._fte_pressure.memory_bytes_by_reservation.pop(reservation_key, None)
+            self._fte_pressure.execution_class_by_reservation.pop(reservation_key, None)
+            self.record_fte_task_started(attempt_id, request)
+
     def record_fte_splits_added(self, attempt_id: Any, split_count: int) -> None:
         key = attempt_key(attempt_id)
         with _FTE_REGISTRY_LOCK:
@@ -173,12 +198,15 @@ class FteWorkerPressureAccountingMixin:
         except Exception:
             return
         if drain:
-            self._drain_fte_pending_tasks()
+            request_fte_pending_task_drain()
 
     def record_fte_task_result_ready(self, attempt_id: Any) -> None:
         """Stop charging worker execution pressure while task output is adopted."""
 
         self._record_fte_task_pressure_complete(attempt_id, drain=True)
+
+    def record_fte_task_result_ready_without_drain(self, attempt_id: Any) -> None:
+        self._record_fte_task_pressure_complete(attempt_id, drain=False)
 
     def record_fte_task_terminal(self, attempt_id: Any, *, drain: bool = True) -> None:
         self._record_fte_task_pressure_complete(attempt_id, drain=drain)
