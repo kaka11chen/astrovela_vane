@@ -55,8 +55,11 @@ def _raise_retry_after_on_google_error(exc: Exception) -> None:
     returns 429 (rate-limited) or 503 (service unavailable).
 
     Parses the ``Retry-After`` header if present; otherwise falls back to
-    a 5-second default wait.
+    a 5-second default wait. Non-finite or negative header values fall
+    back to the same default.
     """
+    import math
+
     from vane.ai.functions import RetryAfterError
 
     code = getattr(exc, "code", None)
@@ -74,7 +77,7 @@ def _raise_retry_after_on_google_error(exc: Exception) -> None:
                 retry_after = float(raw)
             except (TypeError, ValueError):
                 pass
-    if retry_after is None:
+    if retry_after is None or not math.isfinite(retry_after) or retry_after < 0:
         retry_after = 5.0  # default wait for 429/503
 
     raise RetryAfterError(retry_after=retry_after, original=exc) from exc

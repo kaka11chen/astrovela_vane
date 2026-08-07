@@ -3837,6 +3837,79 @@ class TestRetryAfterError:
             asyncio.run(_retry_call_async(fn, max_retries=0, on_error="raise"))
 
 
+class TestRetryAfterErrorValidation:
+    """Tests for RetryAfterError input validation."""
+
+    def test_negative_retry_after_rejected(self):
+        """Negative retry_after values are rejected."""
+        from vane.ai.functions import RetryAfterError
+
+        with pytest.raises(ValueError, match="non-negative"):
+            RetryAfterError(retry_after=-1.0)
+
+    def test_nan_retry_after_rejected(self):
+        """NaN retry_after values are rejected."""
+        import math
+
+        from vane.ai.functions import RetryAfterError
+
+        with pytest.raises(ValueError, match="finite"):
+            RetryAfterError(retry_after=math.nan)
+
+    def test_infinity_retry_after_rejected(self):
+        """Infinity retry_after values are rejected."""
+        import math
+
+        from vane.ai.functions import RetryAfterError
+
+        with pytest.raises(ValueError, match="finite"):
+            RetryAfterError(retry_after=math.inf)
+
+    def test_negative_infinity_retry_after_rejected(self):
+        """Negative infinity retry_after values are rejected."""
+        import math
+
+        from vane.ai.functions import RetryAfterError
+
+        with pytest.raises(ValueError, match="finite"):
+            RetryAfterError(retry_after=-math.inf)
+
+    def test_valid_retry_after_accepted(self):
+        """Valid non-negative finite values are accepted."""
+        from vane.ai.functions import RetryAfterError
+
+        err = RetryAfterError(retry_after=5.0)
+        assert err.retry_after == 5.0
+
+    def test_retry_after_capped_at_120(self):
+        """Values above 120 are capped at 120."""
+        from vane.ai.functions import RetryAfterError
+
+        err = RetryAfterError(retry_after=300.0)
+        assert err.retry_after == 120.0
+
+    def test_zero_retry_after_accepted(self):
+        """Zero is a valid retry_after (no delay)."""
+        from vane.ai.functions import RetryAfterError
+
+        err = RetryAfterError(retry_after=0.0)
+        assert err.retry_after == 0.0
+
+    def test_integer_retry_after_accepted(self):
+        """Integer values are accepted and capped if needed."""
+        from vane.ai.functions import RetryAfterError
+
+        err = RetryAfterError(retry_after=10)
+        assert err.retry_after == 10
+
+    def test_non_numeric_retry_after_rejected(self):
+        """Non-numeric values are rejected."""
+        from vane.ai.functions import RetryAfterError
+
+        with pytest.raises(TypeError, match="number"):
+            RetryAfterError(retry_after="fast")
+
+
 class TestGoogleRetryHandling:
     """Tests for Google provider 429/503 → RetryAfterError conversion."""
 
@@ -3903,6 +3976,60 @@ class TestGoogleRetryHandling:
         exc = RuntimeError("random error")
         # No .code attribute → should not raise
         _raise_retry_after_on_google_error(exc)
+
+    def test_google_nan_retry_after_header_uses_default(self):
+        """NaN Retry-After header falls back to default 5s."""
+        from unittest.mock import MagicMock
+
+        from vane.ai.functions import RetryAfterError
+        from vane.ai.providers.google import _raise_retry_after_on_google_error
+
+        mock_response = MagicMock()
+        mock_response.headers = {"Retry-After": "nan"}
+
+        exc = Exception("rate limited")
+        exc.code = 429
+        exc.response = mock_response
+
+        with pytest.raises(RetryAfterError) as ctx:
+            _raise_retry_after_on_google_error(exc)
+        assert ctx.value.retry_after == 5.0
+
+    def test_google_negative_retry_after_header_uses_default(self):
+        """Negative Retry-After header falls back to default 5s."""
+        from unittest.mock import MagicMock
+
+        from vane.ai.functions import RetryAfterError
+        from vane.ai.providers.google import _raise_retry_after_on_google_error
+
+        mock_response = MagicMock()
+        mock_response.headers = {"Retry-After": "-10"}
+
+        exc = Exception("rate limited")
+        exc.code = 429
+        exc.response = mock_response
+
+        with pytest.raises(RetryAfterError) as ctx:
+            _raise_retry_after_on_google_error(exc)
+        assert ctx.value.retry_after == 5.0
+
+    def test_google_infinity_retry_after_header_uses_default(self):
+        """Infinity Retry-After header falls back to default 5s."""
+        from unittest.mock import MagicMock
+
+        from vane.ai.functions import RetryAfterError
+        from vane.ai.providers.google import _raise_retry_after_on_google_error
+
+        mock_response = MagicMock()
+        mock_response.headers = {"Retry-After": "inf"}
+
+        exc = Exception("rate limited")
+        exc.code = 429
+        exc.response = mock_response
+
+        with pytest.raises(RetryAfterError) as ctx:
+            _raise_retry_after_on_google_error(exc)
+        assert ctx.value.retry_after == 5.0
 
 
 class TestRetryCall:

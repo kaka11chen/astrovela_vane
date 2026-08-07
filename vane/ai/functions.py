@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import time
 from typing import TYPE_CHECKING, Any, Literal, overload
 
@@ -104,9 +105,17 @@ class RetryAfterError(Exception):
     The retry helpers honour :attr:`retry_after` for the sleep duration.
     """
 
+    MAX_RETRY_AFTER = 120
+
     def __init__(self, retry_after: float, original: Exception | None = None) -> None:
+        if not isinstance(retry_after, (int, float)):
+            raise TypeError(f"retry_after must be a number, got {type(retry_after).__name__}")
+        if not math.isfinite(retry_after):
+            raise ValueError(f"retry_after must be finite, got {retry_after}")
+        if retry_after < 0:
+            raise ValueError(f"retry_after must be non-negative, got {retry_after}")
         super().__init__(str(original) if original else "RetryAfterError")
-        self.retry_after = retry_after
+        self.retry_after = min(retry_after, self.MAX_RETRY_AFTER)
         self.__cause__ = original
 
 
@@ -138,7 +147,7 @@ def _retry_call(
             last_exc = exc
             if attempt < max_retries:
                 if isinstance(exc, RetryAfterError):
-                    wait = min(exc.retry_after, 120)
+                    wait = exc.retry_after
                 else:
                     wait = min(2**attempt, 30)  # 1, 2, 4, 8, ... capped at 30s
                 time.sleep(wait)
@@ -170,7 +179,7 @@ async def _retry_call_async(
             last_exc = exc
             if attempt < max_retries:
                 if isinstance(exc, RetryAfterError):
-                    wait = min(exc.retry_after, 120)
+                    wait = exc.retry_after
                 else:
                     wait = min(2**attempt, 30)
                 await asyncio.sleep(wait)
