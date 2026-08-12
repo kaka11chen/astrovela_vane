@@ -541,6 +541,34 @@ public:
 				    "distributed extension write requires DuckDB auto-commit mode so Vane can own its catalog "
 				    "transaction boundary"));
 			}
+			if (!client_context_->transaction.HasActiveTransaction()) {
+				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
+				    "distributed extension write requires an active Vane-owned auto-commit transaction"));
+			}
+			try {
+				extension_write_provider->PrepareDistributedWrite(*client_context_, extension_write_operation);
+			} catch (const std::exception &ex) {
+				string abort_error;
+				try {
+					extension_write_provider->AbortDistributedWrite(*client_context_, extension_write_operation, {});
+				} catch (const std::exception &abort_ex) {
+					abort_error = abort_ex.what();
+				} catch (...) {
+					abort_error = "unknown abort failure";
+				}
+				auto message = string("distributed extension write preparation failed: ") + ex.what();
+				if (!abort_error.empty()) {
+					message += "; extension abort failed: " + abort_error;
+				}
+				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(std::move(message)));
+			} catch (...) {
+				try {
+					extension_write_provider->AbortDistributedWrite(*client_context_, extension_write_operation, {});
+				} catch (...) {
+				}
+				return DuckDBResult<PlanResult>::err(
+				    DuckDBError::external_error("distributed extension write preparation threw an unknown exception"));
+			}
 		}
 		auto exec_cfg = plan->execution_config();
 		if (exec_cfg && worker_manager_ &&
@@ -584,9 +612,21 @@ public:
 			pipeline_res = physical_plan_to_pipeline_node_wrapper(cfg, physical_plan, client_context_.get(),
 			                                                      extension_write_info.get());
 		} catch (const std::exception &ex) {
+			if (extension_write_provider) {
+				try {
+					extension_write_provider->AbortDistributedWrite(*client_context_, extension_write_operation, {});
+				} catch (...) {
+				}
+			}
 			return DuckDBResult<PlanResult>::err(DuckDBError(std::string("Failed to translate plan: ") + ex.what()));
 		}
 		if (pipeline_res.is_err()) {
+			if (extension_write_provider) {
+				try {
+					extension_write_provider->AbortDistributedWrite(*client_context_, extension_write_operation, {});
+				} catch (...) {
+				}
+			}
 			return DuckDBResult<PlanResult>::err(pipeline_res.error());
 		}
 		if (!pipeline_res.value()) {
@@ -796,10 +836,6 @@ public:
 		};
 
 		if (extension_write_provider) {
-			if (!client_context_->transaction.HasActiveTransaction()) {
-				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
-				    "distributed extension write requires an active Vane-owned auto-commit transaction"));
-			}
 			try {
 				extension_write_provider->ValidateDistributedWrite(*client_context_, extension_write_operation);
 			} catch (const std::exception &ex) {

@@ -85,6 +85,102 @@ def test_insert_into_with_ray_runner_rejects_explicit_transaction(monkeypatch):
         connection.execute("ROLLBACK")
 
 
+def test_table_update_delete_and_create_dispatch_ray_writes(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    import vane
+
+    calls = []
+
+    class FakeRayRunner:
+        def run_write(self, relation):
+            calls.append(relation)
+            return {"ok": True}
+
+    runners = types.ModuleType("vane.runners")
+    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+
+    connection = vane.connect()
+    connection.execute("CREATE TABLE target (value INTEGER)")
+    connection.execute("INSERT INTO target VALUES (1), (2)")
+
+    connection.table("target").update(
+        {"value": vane.ConstantExpression(42)},
+        condition=vane.ColumnExpression("value") == 1,
+    )
+    connection.table("target").delete(condition=vane.ColumnExpression("value") == 2)
+    connection.sql("SELECT 7 AS value").create("created_target")
+
+    assert len(calls) == 3
+    assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
+    assert connection.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'created_target'"
+    ).fetchone() == (0,)
+
+
+def test_table_update_delete_and_create_run_with_local_fast(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    import vane
+
+    connection = vane.connect()
+    connection.execute("CREATE TABLE target (value INTEGER)")
+    connection.execute("INSERT INTO target VALUES (1), (2)")
+
+    connection.table("target").update(
+        {"value": vane.ConstantExpression(42)},
+        condition=vane.ColumnExpression("value") == 1,
+    )
+    connection.table("target").delete(condition=vane.ColumnExpression("value") == 2)
+    connection.sql("SELECT 7 AS value").create("created_target")
+
+    assert connection.execute("SELECT * FROM target").fetchall() == [(42,)]
+    assert connection.execute("SELECT * FROM created_target").fetchall() == [(7,)]
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_name"),
+    [
+        ("update", "update"),
+        ("delete", "delete"),
+        ("create", "create"),
+    ],
+)
+def test_distributed_relation_writes_reject_explicit_transactions(monkeypatch, operation, expected_name):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    import vane
+
+    calls = []
+
+    class FakeRayRunner:
+        def run_write(self, relation):
+            calls.append(relation)
+            return {"ok": True}
+
+    runners = types.ModuleType("vane.runners")
+    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+
+    connection = vane.connect()
+    connection.execute("CREATE TABLE target (value INTEGER)")
+    connection.execute("INSERT INTO target VALUES (1)")
+    connection.execute("BEGIN")
+    try:
+        with pytest.raises(
+            vane.InvalidInputException,
+            match=rf"Ray {expected_name} requires DuckDB auto-commit mode",
+        ):
+            if operation == "update":
+                connection.table("target").update({"value": vane.ConstantExpression(2)})
+            elif operation == "delete":
+                connection.table("target").delete()
+            else:
+                connection.sql("SELECT 7 AS value").create("created_target")
+
+        assert calls == []
+    finally:
+        connection.execute("ROLLBACK")
+
+
 def test_write_failure_releases_cache_and_preserves_configured_native_runner(tmp_path, monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     import vane

@@ -671,6 +671,7 @@ SinkFinalizeType PhysicalCopyToFile::FinalizeInternal(ClientContext &context, Gl
 	if (partition_output) {
 		// finalize any outstanding partitions
 		gstate.FinalizePartitions(context, *this);
+		gstate.finalized = true;
 		return SinkFinalizeType::READY;
 	}
 	if (per_thread_output) {
@@ -681,6 +682,7 @@ SinkFinalizeType PhysicalCopyToFile::FinalizeInternal(ClientContext &context, Gl
 			gstate.global_state = CreateFileState(context, *sink_state, *global_lock);
 			function.copy_to_finalize(context, *bind_data, *gstate.global_state);
 		}
+		gstate.finalized = true;
 		return SinkFinalizeType::READY;
 	}
 	if (function.copy_to_finalize && gstate.global_state) {
@@ -694,6 +696,7 @@ SinkFinalizeType PhysicalCopyToFile::FinalizeInternal(ClientContext &context, Gl
 			MoveTmpFile(context, file_path);
 		}
 	}
+	gstate.finalized = true;
 	return SinkFinalizeType::READY;
 }
 
@@ -701,7 +704,7 @@ SinkFinalizeType PhysicalCopyToFile::Finalize(Pipeline &pipeline, Event &event, 
                                               OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<CopyToFunctionGlobalState>();
 	auto result = FinalizeInternal(context, input.global_state);
-	gstate.finalized = true;
+	D_ASSERT(gstate.finalized);
 	return result;
 }
 

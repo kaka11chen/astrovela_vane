@@ -219,6 +219,16 @@ cannot override that static contract.
 contract before translation, task selection, or artifact creation. There is no
 mode inference: the physical shape must exactly match the declared mode.
 
+Before any translation pass, Vane calls `PrepareDistributedWorkerPlan`. The
+default implementation is a no-op. This hook may idempotently replace a
+coordinator-only child with a serializable worker input, but it must remain
+side-effect free because resource planning runs before the write transaction is
+opened. After protocol validation and after opening Vane's auto-commit
+transaction, `PlanRunner` calls `PrepareDistributedWrite`. An extension may use
+that second hook to resolve transaction-local catalog state. Any durable state
+created there must be addressable by the stable operation ID and removable by
+`AbortDistributedWrite` on a known pre-commit failure.
+
 ### File-artifact mode
 
 `FILE_ARTIFACT` is the fixed adapter for extension operators whose single child
@@ -281,15 +291,19 @@ succeeded but its response was lost.
 
 Both modes use the same coordinator sequence:
 
-1. Validate the complete provider and worker protocol, passing the stable Vane
-   operation/query ID, before side effects.
-2. Execute worker sinks and select successful task attempts.
-3. Validate and aggregate their opaque result envelopes.
-4. Call `FinalizeDistributedWrite` with exactly the selected envelopes inside
+1. Validate the complete provider and worker protocol and establish the stable
+   Vane operation/query ID.
+2. Call the side-effect-free `PrepareDistributedWorkerPlan` before resource
+   planning.
+3. Call `PrepareDistributedWrite` inside Vane's active transaction, then
+   translate the prepared worker subtree.
+4. Execute worker sinks and select successful task attempts.
+5. Validate and aggregate their opaque result envelopes.
+6. Call `FinalizeDistributedWrite` with exactly the selected envelopes inside
    Vane's active coordinator transaction.
-5. Require the provider's affected-row count to match the envelope total.
-6. Commit through DuckDB's transaction manager.
-7. For `FILE_ARTIFACT`, publish the committed file marker after catalog commit.
+7. Require the provider's affected-row count to match the envelope total.
+8. Commit through DuckDB's transaction manager.
+9. For `FILE_ARTIFACT`, publish the committed file marker after catalog commit.
 
 `AbortDistributedWrite` is mandatory. Vane supplies the stable operation ID
 and invokes it once for known pre-commit failures, including cases where no
