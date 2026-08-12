@@ -520,7 +520,7 @@ public:
 			return DuckDBResult<PlanResult>::err(DuckDBError("run_plan requires a physical plan root"));
 		}
 		auto extension_write_provider = physical_plan->Root().GetExtensionWriteTaskProvider();
-		const DistributedExtensionWriteInfo *extension_write_info = nullptr;
+		unique_ptr<DistributedExtensionWriteInfo> extension_write_info;
 		DistributedWriteOperationContext extension_write_operation;
 		if (extension_write_provider) {
 			if (physical_plan->Root().type != PhysicalOperatorType::EXTENSION) {
@@ -530,24 +530,8 @@ public:
 			try {
 				extension_write_operation.operation_id = plan->query_id();
 				extension_write_operation.Validate();
-				extension_write_info = &extension_write_provider->WriteInfo();
-				extension_write_info->Validate();
-				DistributedExtensionManager::Get(*client_context_).RequireCapability(extension_write_info->capability);
-				if (extension_write_info->mode == DistributedWriteMode::CALLBACK) {
-					auto callbacks = DistributedExtensionManager::Get(*client_context_)
-					                     .GetWriteCallbacks(extension_write_info->capability);
-					callbacks->Validate(extension_write_info->capability.CanonicalIdentity());
-					if (callbacks->fragment_codec != extension_write_info->fragment_codec ||
-					    callbacks->fragment_codec_version != extension_write_info->fragment_codec_version) {
-						throw InvalidInputException(
-						    "distributed extension write '%s' coordinator callback codec mismatch: plan=%s@%llu "
-						    "registered=%s@%llu",
-						    extension_write_info->write_name, extension_write_info->fragment_codec,
-						    static_cast<unsigned long long>(extension_write_info->fragment_codec_version),
-						    callbacks->fragment_codec,
-						    static_cast<unsigned long long>(callbacks->fragment_codec_version));
-					}
-				}
+				extension_write_info = make_uniq<DistributedExtensionWriteInfo>(
+				    ResolveDistributedExtensionWriteInfo(*client_context_, extension_write_provider->WritePlan()));
 			} catch (const std::exception &ex) {
 				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
 				    StringUtil::Format("distributed extension write protocol validation failed: %s", ex.what())));
@@ -650,18 +634,18 @@ public:
 			    (copy_sink_count != 1 || callback_sink_count != 0)) {
 				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
 				    StringUtil::Format("distributed file-artifact write %s did not translate to exactly one COPY sink",
-				                       extension_write_info->write_name)));
+				                       extension_write_info->Name())));
 			}
 			if (extension_write_info->mode == DistributedWriteMode::CALLBACK &&
 			    (callback_sink_count != 1 || copy_sink_count != 0)) {
 				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
 				    StringUtil::Format("distributed callback write %s did not translate to exactly one callback sink",
-				                       extension_write_info->write_name)));
+				                       extension_write_info->Name())));
 			}
 			if (copy_sink_node && !copy_sink_node->staging_root_base().empty()) {
 				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
 				    StringUtil::Format("distributed file-artifact write %s requires worker direct-write output",
-				                       extension_write_info->write_name)));
+				                       extension_write_info->Name())));
 			}
 		}
 
@@ -730,7 +714,7 @@ public:
 						return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(StringUtil::Format(
 						    "distributed extension write %s has a catalog-commit-pending lifecycle; its catalog "
 						    "commit outcome is unknown, so automatic retry is refused and output is retained",
-						    extension_write_info->write_name)));
+						    extension_write_info->Name())));
 					}
 				}
 				auto prepared_manifest_res = CheckDistributedCopyFileExists(fs, inspection.paths.manifest_path);
@@ -741,7 +725,7 @@ public:
 					return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(StringUtil::Format(
 					    "distributed extension write %s has a prepared output manifest but no committed marker; "
 					    "its catalog commit outcome is unknown, so automatic retry is refused and output is retained",
-					    extension_write_info->write_name)));
+					    extension_write_info->Name())));
 				}
 			}
 		}
@@ -916,7 +900,7 @@ public:
 					if (callback_sink_node && item.second.fragments().size() != 1) {
 						return fail_after_write_cleanup(DuckDBError::invalid_state_error(StringUtil::Format(
 						    "distributed callback write %s worker output must contain exactly one result partition",
-						    extension_write_info->write_name)));
+						    extension_write_info->Name())));
 					}
 					for (auto &part : item.second.fragments()) {
 						partitions.push_back(part);
@@ -952,7 +936,7 @@ public:
 					return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(StringUtil::Format(
 					    "distributed extension write %s encountered a concurrently prepared output manifest but no "
 					    "committed marker; its catalog commit outcome is unknown, so output is retained",
-					    extension_write_info->write_name)));
+					    extension_write_info->Name())));
 				}
 				try {
 					selected_task_results = EncodeDistributedFileWriteResults(
@@ -998,7 +982,7 @@ public:
 					if (affected_rows != copy_result.rows_copied) {
 						throw InvalidInputException("Distributed extension write %s finalized %llu rows from worker "
 						                            "metadata totaling %llu rows",
-						                            extension_write_info->write_name,
+						                            extension_write_info->Name(),
 						                            static_cast<unsigned long long>(affected_rows),
 						                            static_cast<unsigned long long>(copy_result.rows_copied));
 					}
@@ -1025,7 +1009,7 @@ public:
 					if (task_rows > std::numeric_limits<idx_t>::max() - result.rows_written ||
 					    task_bytes > std::numeric_limits<idx_t>::max() - result.bytes_written) {
 						throw InvalidInputException("distributed extension write '%s' result counts overflow",
-						                            extension_write_info->write_name);
+						                            extension_write_info->Name());
 					}
 					result.rows_written += task_rows;
 					result.bytes_written += task_bytes;
@@ -1035,7 +1019,7 @@ public:
 				if (affected_rows != result.rows_written) {
 					throw InvalidInputException(
 					    "Distributed extension write %s finalized %llu rows from worker fragments totaling %llu rows",
-					    extension_write_info->write_name, static_cast<unsigned long long>(affected_rows),
+					    extension_write_info->Name(), static_cast<unsigned long long>(affected_rows),
 					    static_cast<unsigned long long>(result.rows_written));
 				}
 				result.selected_task_results = std::move(selected_task_results);
