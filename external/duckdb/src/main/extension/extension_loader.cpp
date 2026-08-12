@@ -231,6 +231,66 @@ unique_ptr<DistributedExtensionManifest> ExtensionLoader::BindDistributedTableFu
 	return candidate_manifest;
 }
 
+void ExtensionLoader::RegisterExistingTableFunctionDistributedScan(const string &name) {
+	auto &entry = GetTableFunction(name);
+	auto &functions = entry.functions;
+	if (functions.functions.empty()) {
+		throw InvalidInputException("Existing table function '%s' has no overloads", name);
+	}
+
+	idx_t protocol_version = 0;
+	for (auto &function : functions.functions) {
+		if (!function.HasDistributedScanCallbacks()) {
+			throw InvalidInputException(
+			    "Existing table function '%s' must define distributed callbacks for every overload", name);
+		}
+		if (!function.HasSerializationCallbacks()) {
+			throw InvalidInputException(
+			    "Distributed table function '%s' must define serialize and deserialize callbacks before registration",
+			    name);
+		}
+		const auto &callbacks = function.GetDistributedScanCallbacks();
+		callbacks.ValidateDefinition(name);
+		if (protocol_version == 0) {
+			protocol_version = callbacks.protocol_version;
+		} else if (protocol_version != callbacks.protocol_version) {
+			throw InvalidInputException(
+			    "Distributed table function '%s' overloads must use one capability protocol version", name);
+		}
+	}
+
+	auto &manifest = GetOrCreateDistributedManifest();
+	DistributedExtensionCapability capability;
+	capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
+	capability.name = name;
+	capability.protocol_version = protocol_version;
+	auto candidate_manifest = make_uniq<DistributedExtensionManifest>(manifest);
+	bool capability_exists = false;
+	for (const auto &registered : candidate_manifest->capabilities) {
+		if (registered.kind != capability.kind || registered.name != capability.name) {
+			continue;
+		}
+		if (registered.protocol_version != capability.protocol_version) {
+			throw InvalidInputException(
+			    "Distributed table function '%s' protocol mismatch: callbacks use %llu, manifest uses %llu", name,
+			    static_cast<unsigned long long>(capability.protocol_version),
+			    static_cast<unsigned long long>(registered.protocol_version));
+		}
+		capability_exists = true;
+	}
+	if (!capability_exists) {
+		candidate_manifest->capabilities.push_back(capability);
+	}
+	DistributedExtensionManager::ValidateManifest(*candidate_manifest);
+
+	auto bound_functions = functions.functions;
+	for (auto &function : bound_functions) {
+		function.BindDistributedScanCapability(extension_name);
+	}
+	functions.functions = std::move(bound_functions);
+	distributed_manifest = std::move(candidate_manifest);
+}
+
 void ExtensionLoader::RegisterFunction(CreateTableFunctionInfo info) {
 	D_ASSERT(!info.functions.name.empty());
 	auto candidate_manifest = BindDistributedTableFunctions(info.functions);
