@@ -581,7 +581,8 @@ public:
 
 		DuckDBResult<std::shared_ptr<DistributedPipelineNode>> pipeline_res;
 		try {
-			pipeline_res = physical_plan_to_pipeline_node_wrapper(cfg, physical_plan, client_context_.get());
+			pipeline_res = physical_plan_to_pipeline_node_wrapper(cfg, physical_plan, client_context_.get(),
+			                                                      extension_write_info.get());
 		} catch (const std::exception &ex) {
 			return DuckDBResult<PlanResult>::err(DuckDBError(std::string("Failed to translate plan: ") + ex.what()));
 		}
