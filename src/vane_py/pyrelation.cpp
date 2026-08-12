@@ -28,7 +28,10 @@
 #include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/main/relation/value_relation.hpp"
 #include "duckdb/main/relation/filter_relation.hpp"
+#include "duckdb/main/relation/delete_relation.hpp"
+#include "duckdb/main/relation/table_relation.hpp"
 #include "duckdb/main/relation/unnest_relation.hpp"
+#include "duckdb/main/relation/update_relation.hpp"
 #include "vane_python/expression/pyexpression.hpp"
 #include "duckdb/common/arrow/physical_arrow_collector.hpp"
 #include "vane_python/arrow/arrow_export_utils.hpp"
@@ -1142,7 +1145,7 @@ static RunnerForDatabase GetOrCreateRunnerForDB(const shared_ptr<Relation> &rel,
 // Try to dispatch a write relation to the Python runner.
 // Returns true if dispatched, false if this relation should run locally.
 static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py::object &connection_owner,
-                                bool require_ray_auto_commit = false) {
+                                bool require_ray_auto_commit = false, const string &operation_name = "write") {
 	auto runner_type = ResolveRunnerType();
 	if (runner_type == "local-fast") {
 		return false;
@@ -1153,9 +1156,9 @@ static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py:
 		}
 		auto context = write_rel->context->GetContext();
 		if (!context->transaction.IsAutoCommit()) {
-			throw InvalidInputException(
-			    "Ray insert_into requires DuckDB auto-commit mode because distributed execution cannot participate in "
-			    "the caller's explicit transaction");
+			throw InvalidInputException("Ray %s requires DuckDB auto-commit mode because distributed execution cannot "
+			                            "participate in the caller's explicit transaction",
+			                            operation_name);
 		}
 	}
 	auto runner_for_db = GetOrCreateRunnerForDB(write_rel, runner_type);
@@ -2023,7 +2026,7 @@ void DuckDBPyRelation::InsertInto(const string &table) {
 	AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
 	auto insert = rel->InsertRel(parsed_info.catalog, parsed_info.schema, parsed_info.name);
-	if (TryDispatchToRunner(insert, connection_owner, true)) {
+	if (TryDispatchToRunner(insert, connection_owner, true, "insert_into")) {
 		return;
 	}
 	PyExecuteRelation(insert);
@@ -2070,7 +2073,40 @@ void DuckDBPyRelation::Update(const py::object &set_p, const py::object &where) 
 		expressions.push_back(py_expr->GetExpression().Copy());
 	}
 
-	return rel->Update(std::move(names), std::move(expressions), std::move(condition));
+	if (rel->type != RelationType::TABLE_RELATION) {
+		throw InvalidInputException("'DuckDBPyRelation.update' can only be used on a table relation");
+	}
+	auto &table = static_cast<TableRelation &>(*rel);
+	auto update = make_shared_ptr<UpdateRelation>(rel->context, std::move(condition), table.description->database,
+	                                              table.description->schema, table.description->table, std::move(names),
+	                                              std::move(expressions));
+	if (TryDispatchToRunner(update, connection_owner, true, "update")) {
+		return;
+	}
+	PyExecuteRelation(update);
+}
+
+void DuckDBPyRelation::Delete(const py::object &where) {
+	AssertRelation();
+	if (rel->type != RelationType::TABLE_RELATION) {
+		throw InvalidInputException("'DuckDBPyRelation.delete' can only be used on a table relation");
+	}
+	unique_ptr<ParsedExpression> condition;
+	if (!py::none().is(where)) {
+		shared_ptr<DuckDBPyExpression> py_expr;
+		if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(where, py_expr)) {
+			throw InvalidInputException("Please provide an Expression to 'condition'");
+		}
+		condition = py_expr->GetExpression().Copy();
+	}
+	auto &table = static_cast<TableRelation &>(*rel);
+	auto delete_relation =
+	    make_shared_ptr<DeleteRelation>(rel->context, std::move(condition), table.description->database,
+	                                    table.description->schema, table.description->table);
+	if (TryDispatchToRunner(delete_relation, connection_owner, true, "delete")) {
+		return;
+	}
+	PyExecuteRelation(delete_relation);
 }
 
 void DuckDBPyRelation::Insert(const py::object &params) const {
@@ -2089,6 +2125,9 @@ void DuckDBPyRelation::Create(const string &table) {
 	AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
 	auto create = rel->CreateRel(parsed_info.catalog, parsed_info.schema, parsed_info.name, false);
+	if (TryDispatchToRunner(create, connection_owner, true, "create")) {
+		return;
+	}
 	PyExecuteRelation(create);
 }
 

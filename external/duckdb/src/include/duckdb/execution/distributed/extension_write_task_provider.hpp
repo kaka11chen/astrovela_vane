@@ -44,6 +44,22 @@ public:
 	//! Immutable extension/operator key and extension-owned worker bind envelope.
 	virtual const DistributedExtensionWritePlan &WritePlan() const = 0;
 
+	//! Expose a side-effect-free, serializable worker subtree before any
+	//! distributed translation pass. Resource planning can translate a physical
+	//! write before Vane opens the transaction used for execution, so this hook
+	//! must not create catalog entries or durable artifacts. It may only perform
+	//! idempotent in-memory plan rewrites.
+	virtual void PrepareDistributedWorkerPlan(ClientContext &context,
+	                                          const DistributedWriteOperationContext &operation) {
+	}
+
+	//! Prepare the coordinator-owned physical write before Vane translates its
+	//! worker subtree. Extensions can use this hook to resolve catalog state and
+	//! replace coordinator-only children with a serializable worker input. Any
+	//! durable state created here must be removable through AbortDistributedWrite.
+	virtual void PrepareDistributedWrite(ClientContext &context, const DistributedWriteOperationContext &operation) {
+	}
+
 	//! Validate coordinator/catalog state before any worker callback can run.
 	//! The stable operation identity may name an earlier attempt, so callback
 	//! providers must reconcile any durable operation state here without
