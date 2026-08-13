@@ -57,6 +57,10 @@ public:
 	DUCKDB_API void RegisterFunction(TableFunction function);
 	DUCKDB_API void RegisterFunction(TableFunctionSet function);
 	DUCKDB_API void RegisterFunction(CreateTableFunctionInfo info);
+	//! Publish distributed scan callbacks installed on a table function that was
+	//! registered through a legacy or C API path. Every existing overload must
+	//! already carry complete bind serde and distributed scan callbacks.
+	DUCKDB_API void RegisterExistingTableFunctionDistributedScan(const string &name);
 
 	//! Register a new pragma function - throw an exception if the function already exists
 	DUCKDB_API void RegisterFunction(PragmaFunction function);

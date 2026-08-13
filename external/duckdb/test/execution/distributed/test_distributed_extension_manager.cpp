@@ -4,6 +4,8 @@
 #include "catch.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -12,6 +14,7 @@
 #include "duckdb/function/distributed_write.hpp"
 #include "duckdb/main/distributed_extension_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 using namespace duckdb;
 
@@ -174,6 +177,37 @@ public:
 	}
 };
 
+class ExistingDistributedTableFunctionExtension : public Extension {
+public:
+	void Load(ExtensionLoader &loader) override {
+		TableFunctionSet functions("existing_distributed_scan");
+		functions.AddFunction(TableFunction({LogicalType::INTEGER}, DistributedOverloadScan, DistributedOverloadBind));
+		functions.AddFunction(TableFunction({LogicalType::BIGINT}, DistributedOverloadScan, DistributedOverloadBind));
+		CreateTableFunctionInfo info(std::move(functions));
+		auto &catalog = Catalog::GetSystemCatalog(loader.GetDatabaseInstance());
+		auto transaction = CatalogTransaction::GetSystemTransaction(loader.GetDatabaseInstance());
+		catalog.CreateFunction(transaction, info);
+
+		auto &entry = loader.GetTableFunction("existing_distributed_scan");
+		for (auto &function : entry.functions.functions) {
+			function.serialize = DistributedOverloadSerialize;
+			function.deserialize = DistributedOverloadDeserialize;
+			TableFunctionDistributedScanCallbacks callbacks;
+			callbacks.protocol_version = 1;
+			callbacks.task_codec = {"existing-distributed.task", 1};
+			callbacks.plan = DistributedOverloadPlan;
+			callbacks.prepare_bind = DistributedOverloadPrepare;
+			callbacks.apply_tasks = DistributedOverloadApply;
+			function.SetDistributedScanCallbacks(std::move(callbacks));
+		}
+		loader.RegisterExistingTableFunctionDistributedScan("existing_distributed_scan");
+	}
+
+	string Name() override {
+		return "existing_distributed";
+	}
+};
+
 } // namespace
 
 TEST_CASE("Distributed extension manifests are deterministic and exact", "[distributed][extension]") {
@@ -303,5 +337,31 @@ TEST_CASE("ExtensionLoader derives one capability across separately registered t
 	auto integer_result = connection.Query("SELECT * FROM distributed_overload_scan(1::INTEGER)");
 	REQUIRE_NO_FAIL(*integer_result);
 	auto bigint_result = connection.Query("SELECT * FROM distributed_overload_scan(1::BIGINT)");
+	REQUIRE_NO_FAIL(*bigint_result);
+}
+
+TEST_CASE("ExtensionLoader publishes callbacks attached to an existing C API table function",
+          "[distributed][extension]") {
+	DuckDB db(nullptr);
+	REQUIRE_NOTHROW(db.LoadStaticExtension<ExistingDistributedTableFunctionExtension>());
+
+	REQUIRE(ManagerHasContractIdentity(DistributedExtensionManager::Get(*db.instance),
+	                                   "existing_distributed{table_function:existing_distributed_scan@1}"));
+	auto &catalog = Catalog::GetSystemCatalog(*db.instance);
+	auto transaction = CatalogTransaction::GetSystemTransaction(*db.instance);
+	auto &schema = catalog.GetSchema(transaction, DEFAULT_SCHEMA);
+	auto entry_ptr = schema.GetEntry(transaction, CatalogType::TABLE_FUNCTION_ENTRY, "existing_distributed_scan");
+	REQUIRE(entry_ptr);
+	auto &entry = entry_ptr->Cast<TableFunctionCatalogEntry>();
+	for (const auto &function : entry.functions.functions) {
+		REQUIRE(function.HasSerializationCallbacks());
+		REQUIRE(function.HasDistributedScanCallbacks());
+		REQUIRE(function.GetDistributedScanCallbacks().GetCapability().extension_name == "existing_distributed");
+	}
+
+	Connection connection(db);
+	auto integer_result = connection.Query("SELECT * FROM existing_distributed_scan(1::INTEGER)");
+	REQUIRE_NO_FAIL(*integer_result);
+	auto bigint_result = connection.Query("SELECT * FROM existing_distributed_scan(1::BIGINT)");
 	REQUIRE_NO_FAIL(*bigint_result);
 }
