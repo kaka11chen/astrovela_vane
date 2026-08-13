@@ -23,7 +23,6 @@
 #include <duckdb/execution/distributed/copy_to_file.hpp>
 #include <duckdb/execution/distributed/copy_finalize.hpp>
 #include <duckdb/execution/distributed/extension_write_task_provider.hpp>
-#include <duckdb/execution/distributed/planning_state.hpp>
 #include <duckdb/execution/distributed/plan/exchange_sink_instance_task.hpp>
 #include <duckdb/execution/distributed/plan/exchange_source_task.hpp>
 #include <duckdb/execution/distributed/plan/fte_split_queue.hpp>
@@ -321,6 +320,9 @@ static py::list ReadIntegerExchangeSourceForTest(duckdb::ClientContext &context,
 void register_ray_bindings(py::module_ &mod) {
 	auto m = mod.def_submodule("ray_cxx");
 	m.doc() = "C++ Ray execution bindings (experimental)";
+	m.def(
+	    "_new_distributed_operation_id", []() { return UUIDv7::ToString(UUIDv7::GenerateRandomUUID()); },
+	    "Return a UUIDv7 suitable for a distributed operation and catalog idempotency key.");
 	m.def(
 	    "_install_counting_result_collector_for_test",
 	    [](py::object conn_obj) {

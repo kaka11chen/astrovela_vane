@@ -307,14 +307,6 @@ public:
 
 	virtual PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
 	                                            LogicalCreateTable &op, PhysicalOperator &plan) = 0;
-	//! Return true only when an existing CTAS target durably proves that the
-	//! supplied distributed operation already committed. This lets the catalog
-	//! rebuild its extension-write provider so reconciliation can run before
-	//! preparation or workers. Normal create-conflict behavior remains unchanged.
-	virtual bool CanPlanCreateTableAsReplay(ClientContext &context, LogicalCreateTable &op,
-	                                        CatalogEntry &existing_entry, const string &operation_id) {
-		return false;
-	}
 	virtual PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
 	                                     optional_ptr<PhysicalOperator> plan) = 0;
 	virtual PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,

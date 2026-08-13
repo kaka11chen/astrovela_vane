@@ -104,6 +104,8 @@ def test_insert_update_delete_and_ctas_dispatch_ray_writes(monkeypatch):
     connection.execute("CREATE TABLE target (value INTEGER)")
     connection.execute("INSERT INTO target VALUES (1), (2)")
 
+    connection.sql("SELECT 3 AS value").insert_into("target")
+    connection.table("target").insert([4])
     connection.table("target").update(
         {"value": vane.ConstantExpression(42)},
         condition=vane.ColumnExpression("value") == 1,
@@ -111,11 +113,47 @@ def test_insert_update_delete_and_ctas_dispatch_ray_writes(monkeypatch):
     connection.table("target").delete(condition=vane.ColumnExpression("value") == 2)
     connection.sql("SELECT 7 AS value").create("created_target")
 
-    assert len(calls) == 3
+    assert len(calls) == 5
     assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
     assert connection.execute(
         "SELECT count(*) FROM information_schema.tables WHERE table_name = 'created_target'"
     ).fetchone() == (0,)
+
+
+def test_nested_relation_write_does_not_reuse_a_cached_different_backend(tmp_path, monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    import vane
+
+    local_calls = []
+    ray_calls = []
+
+    class FakeLocalRunner:
+        def run_write(self, relation):
+            local_calls.append(relation)
+            if len(local_calls) == 1:
+                monkeypatch.setenv("VANE_RUNNER", "ray")
+                connection.sql("SELECT 42 AS value").insert_into("target")
+            return {"ok": True}
+
+    class FakeRayRunner:
+        def run_write(self, relation):
+            ray_calls.append(relation)
+            return {"ok": True}
+
+    local_runner = FakeLocalRunner()
+    ray_runner = FakeRayRunner()
+    runners = types.ModuleType("vane.runners")
+    runners.set_runner_local = lambda *_args, **_kwargs: local_runner
+    runners.set_runner_ray = lambda *_args, **_kwargs: ray_runner
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+
+    connection = vane.connect()
+    connection.execute("CREATE TABLE target (value INTEGER)")
+    connection.sql("SELECT 1 AS value").write_parquet(str(tmp_path / "nested.parquet"))
+
+    assert len(local_calls) == 1
+    assert len(ray_calls) == 1
+    assert connection.execute("SELECT count(*) FROM target").fetchone() == (0,)
 
 
 def test_insert_update_delete_and_ctas_run_with_local_fast(monkeypatch):
@@ -127,6 +165,7 @@ def test_insert_update_delete_and_ctas_run_with_local_fast(monkeypatch):
     connection.execute("INSERT INTO target VALUES (1), (2)")
 
     connection.sql("SELECT 3 AS value").insert_into("target")
+    connection.table("target").insert([4])
     connection.table("target").update(
         {"value": vane.ConstantExpression(42)},
         condition=vane.ColumnExpression("value") == 1,
@@ -134,7 +173,7 @@ def test_insert_update_delete_and_ctas_run_with_local_fast(monkeypatch):
     connection.table("target").delete(condition=vane.ColumnExpression("value") == 2)
     connection.sql("SELECT 7 AS value").create("created_target")
 
-    assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(3,), (42,)]
+    assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(3,), (4,), (42,)]
     assert connection.execute("SELECT * FROM created_target").fetchall() == [(7,)]
 
 
@@ -142,6 +181,7 @@ def test_insert_update_delete_and_ctas_run_with_local_fast(monkeypatch):
     ("operation", "expected_name"),
     [
         ("insert", "INSERT INTO"),
+        ("insert_values", "INSERT"),
         ("update", "UPDATE"),
         ("delete", "DELETE"),
         ("create", "CTAS"),
@@ -173,6 +213,8 @@ def test_distributed_relation_writes_reject_explicit_transactions(monkeypatch, o
         ):
             if operation == "insert":
                 connection.sql("SELECT 2 AS value").insert_into("target")
+            elif operation == "insert_values":
+                connection.table("target").insert([2])
             elif operation == "update":
                 connection.table("target").update({"value": vane.ConstantExpression(2)})
             elif operation == "delete":
@@ -190,6 +232,7 @@ def test_distributed_relation_writes_reject_explicit_transactions(monkeypatch, o
     ("operation", "expected_name"),
     [
         ("insert", "INSERT INTO"),
+        ("insert_values", "INSERT"),
         ("update", "UPDATE"),
         ("delete", "DELETE"),
         ("create", "CTAS"),
@@ -212,6 +255,8 @@ def test_relation_writes_require_explicit_ray_or_local_fast(monkeypatch, configu
     ):
         if operation == "insert":
             connection.sql("SELECT 2 AS value").insert_into("target")
+        elif operation == "insert_values":
+            connection.table("target").insert([2])
         elif operation == "update":
             connection.table("target").update({"value": vane.ConstantExpression(2)})
         elif operation == "delete":
@@ -225,7 +270,7 @@ def test_relation_writes_require_explicit_ray_or_local_fast(monkeypatch, configu
     ).fetchone() == (0,)
 
 
-@pytest.mark.parametrize("operation", ["insert", "update", "delete", "create"])
+@pytest.mark.parametrize("operation", ["insert", "insert_values", "update", "delete", "create"])
 def test_ray_relation_write_failure_never_falls_back(monkeypatch, operation):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     import vane
@@ -245,6 +290,8 @@ def test_ray_relation_write_failure_never_falls_back(monkeypatch, operation):
     with pytest.raises(RuntimeError, match=rf"injected distributed {operation} failure"):
         if operation == "insert":
             connection.sql("SELECT 2 AS value").insert_into("target")
+        elif operation == "insert_values":
+            connection.table("target").insert([2])
         elif operation == "update":
             connection.table("target").update({"value": vane.ConstantExpression(2)})
         elif operation == "delete":

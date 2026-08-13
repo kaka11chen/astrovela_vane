@@ -9,7 +9,7 @@ import uuid
 import weakref
 from typing import TYPE_CHECKING, Any
 
-from vane._ray_cxx import require_ray_cxx_attr
+from vane._ray_cxx import new_distributed_operation_id, require_ray_cxx_attr
 from vane._ray_progress_env import ray_log_to_driver_default
 from vane._vane_session import ensure_vane_session_dir
 from vane.runners.ray.admission_ledger import BoundedReplayMap
@@ -172,7 +172,7 @@ class RayRunner(Runner):
             hint="Ensure the C++ ray extension is built and importable in worker processes.",
         )
 
-        query_id = str(uuid.uuid4())
+        query_id = new_distributed_operation_id()
 
         logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
         session_id = str(logical_plan.session_id())

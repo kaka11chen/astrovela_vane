@@ -242,6 +242,14 @@ struct PyPhysicalPlanWrapper {
 			throw duckdb::InvalidInputException(
 			    "Distributed extension write requires exactly one worker-executable child");
 		}
+		if (!client_context_) {
+			throw duckdb::InvalidInputException(
+			    "Distributed extension write serialization preflight requires a ClientContext");
+		}
+		duckdb::distributed::DistributedWriteOperationContext operation;
+		operation.operation_id = plan_->query_id();
+		operation.Validate();
+		root.GetExtensionWriteTaskProvider()->PrepareDistributedWorkerPlan(*client_context_, operation);
 
 		// The extension root owns coordinator-only catalog state and never crosses
 		// the worker boundary. Validate exactly the subtree that task production
@@ -1061,7 +1069,6 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	std::shared_ptr<duckdb::PhysicalPlan> physical_plan;
 	auto &context = *conn_wrapper.con.GetConnection().context;
 	context.RunFunctionInTransaction([&]() {
-		duckdb::distributed::ScopedDistributedPlanningState distributed_planning(context, query_id_);
 		duckdb::MemoryStream stream(duckdb::Allocator::Get(context));
 		stream.WriteData(reinterpret_cast<const uint8_t *>(logical_payload.data()), logical_payload.size());
 		stream.Rewind();
@@ -2805,12 +2812,11 @@ struct PyPhysicalPlanWrapperRunner {
 							}
 							if (plan_res.value().tag == duckdb::distributed::PlanRunner::PlanResult::EXTENSION_WRITE &&
 							    plan_res.value().extension_write_result.catalog_committed) {
-								// Reconciliation or an engine-owned committed marker proved
-								// that an earlier attempt committed. Preparation may still
-								// have created transaction-local state (notably a CTAS target
-								// needed to reconstruct its stable output path). Return the
-								// historical result, but never commit those replay-side
-								// effects into the current transaction.
+								// An engine-owned committed file marker proved that an earlier
+								// attempt completed. Preparation may still have created
+								// transaction-local state while reconstructing its stable output
+								// path. Return the historical result, but never commit those
+								// current-attempt effects.
 								committed_replay_rollback_requested = true;
 								throw PlanResultCommittedReplayRollbackException();
 							}
@@ -2857,7 +2863,8 @@ struct PyPhysicalPlanWrapperRunner {
 							extension_result.catalog_committed = false;
 							extension_result.outcome_unknown = true;
 							extension_result.outcome_error =
-							    "extension catalog commit outcome is unknown; selected artifacts were retained: " +
+							    "extension catalog commit outcome is unknown; Vane did not invoke provider abort or "
+							    "distributed output cleanup: " +
 							    exception_message(extension_catalog_commit_error);
 							if (extension_result.info.mode == DistributedWriteMode::FILE_ARTIFACT) {
 								extension_result.file_result.output_outcome_unknown = true;
@@ -2887,30 +2894,6 @@ struct PyPhysicalPlanWrapperRunner {
 								} else {
 									extension_result.file_result = std::move(commit_res).value();
 								}
-							}
-						}
-						if (extension_result.catalog_committed) {
-							try {
-								auto provider = plan.plan_->physical_plan()->Root().GetExtensionWriteTaskProvider();
-								if (!provider) {
-									throw InternalException(
-									    "committed distributed extension write lost its task provider");
-								}
-								DistributedWriteOperationContext operation;
-								operation.operation_id = plan.plan_->query_id();
-								operation.Validate();
-								// The catalog write transaction is already definitively committed (or
-								// the replay transaction was deliberately rolled back). Open a fresh
-								// transaction so context-scoped filesystem and secret providers remain
-								// usable while the hook removes only post-commit auxiliary state.
-								client_context->RunFunctionInTransaction([&]() {
-									provider->ConfirmDistributedWriteCommit(*client_context, operation,
-									                                        extension_result.selected_task_results);
-								});
-							} catch (...) {
-								post_commit_warnings.push_back(
-								    "extension catalog committed, but post-commit cleanup failed: " +
-								    exception_message(std::current_exception()));
 							}
 						}
 						if (extension_result.info.mode == DistributedWriteMode::FILE_ARTIFACT) {

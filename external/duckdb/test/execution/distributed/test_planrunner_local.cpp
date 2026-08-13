@@ -55,13 +55,6 @@ public:
 		}
 	}
 
-	optional_idx ReconcileCommittedDistributedWrite(ClientContext &,
-	                                                const DistributedWriteOperationContext &operation) const override {
-		reconcile_calls++;
-		reconcile_operation_id = operation.operation_id;
-		return reconciled_rows;
-	}
-
 	void ValidateDistributedWrite(ClientContext &, const DistributedWriteOperationContext &operation) const override {
 		validation_calls++;
 		validation_operation_id = operation.operation_id;
@@ -91,19 +84,16 @@ public:
 	}
 
 	mutable idx_t validation_calls = 0;
-	mutable idx_t reconcile_calls = 0;
 	mutable idx_t prepare_calls = 0;
 	mutable idx_t finalize_calls = 0;
 	mutable idx_t abort_calls = 0;
 	mutable string prepare_operation_id;
-	mutable string reconcile_operation_id;
 	mutable string validation_operation_id;
 	mutable string finalize_operation_id;
 	mutable string abort_operation_id;
 	bool fail_preparation = false;
 	bool fail_validation = false;
 	bool fail_abort = false;
-	optional_idx reconciled_rows;
 
 private:
 	DistributedExtensionWritePlan plan;
@@ -432,14 +422,12 @@ TEST_CASE("PlanRunner aborts an extension write when coordinator preparation fai
 
 	REQUIRE(result.is_err());
 	REQUIRE(StringUtil::Contains(result.error().what(), "planned extension write preparation failure"));
-	REQUIRE(extension.reconcile_calls == 1);
 	REQUIRE(extension.prepare_calls == 1);
 	REQUIRE(extension.validation_calls == 0);
 	REQUIRE(extension.finalize_calls == 0);
 	REQUIRE(extension.abort_calls == 1);
-	REQUIRE(extension.reconcile_operation_id == "planrunner-extension-preparation-failure");
-	REQUIRE(extension.prepare_operation_id == extension.reconcile_operation_id);
-	REQUIRE(extension.abort_operation_id == extension.reconcile_operation_id);
+	REQUIRE(extension.prepare_operation_id == "planrunner-extension-preparation-failure");
+	REQUIRE(extension.abort_operation_id == extension.prepare_operation_id);
 }
 
 TEST_CASE("PlanRunner aborts an extension write after preparation when sink validation fails",
@@ -476,45 +464,6 @@ TEST_CASE("PlanRunner aborts an extension write after preparation when sink vali
 	REQUIRE(extension.abort_calls == 1);
 	REQUIRE(extension.prepare_operation_id == "planrunner-extension-invalid-sink");
 	REQUIRE(extension.abort_operation_id == extension.prepare_operation_id);
-}
-
-TEST_CASE("PlanRunner reconciles a committed extension write before preparation or translation",
-          "[distributed][plan][copy][extension-write]") {
-	DuckDB db(nullptr);
-	Connection con(db);
-	RegisterReplayTestExtension(*db.instance);
-	auto physical_plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
-	vector<LogicalType> child_types {LogicalType::BIGINT};
-	auto &child = physical_plan->Make<PhysicalDummyScan>(std::move(child_types), 1);
-	vector<LogicalType> extension_types {LogicalType::BIGINT};
-	auto &extension_operator = physical_plan->Make<ReplayTestExtensionWriteOperator>(std::move(extension_types));
-	auto &extension = extension_operator.Cast<ReplayTestExtensionWriteOperator>();
-	extension.reconciled_rows = optional_idx(23);
-	extension_operator.children.push_back(child);
-	physical_plan->SetRoot(extension_operator);
-
-	auto workers = setup_workers({{make_worker_id("reconciled-w1"), 1}});
-	auto worker_manager = std::make_shared<MockWorkerManager>(std::move(workers));
-	auto runner = std::make_shared<PlanRunner>(worker_manager, con.context);
-	auto execution_config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
-	auto distributed_plan = std::make_shared<DistributedPhysicalPlan>(21, "planrunner-extension-reconciled",
-	                                                                  physical_plan, std::move(execution_config));
-
-	DuckDBResult<PlanRunner::PlanResult> result;
-	con.context->RunFunctionInTransaction([&]() { result = runner->run_plan(std::move(distributed_plan)); });
-
-	REQUIRE(result.is_ok());
-	REQUIRE(result.value().tag == PlanRunner::PlanResult::EXTENSION_WRITE);
-	REQUIRE(result.value().extension_write_result.catalog_committed);
-	REQUIRE(result.value().extension_write_result.rows_written == 23);
-	REQUIRE(result.value().extension_write_result.file_result.output_committed);
-	REQUIRE(result.value().extension_write_result.file_result.rows_copied == 23);
-	REQUIRE(extension.reconcile_calls == 1);
-	REQUIRE(extension.reconcile_operation_id == "planrunner-extension-reconciled");
-	REQUIRE(extension.prepare_calls == 0);
-	REQUIRE(extension.validation_calls == 0);
-	REQUIRE(extension.finalize_calls == 0);
-	REQUIRE(extension.abort_calls == 0);
 }
 
 TEST_CASE("PlanRunner requires an EXTENSION root for extension write providers",
