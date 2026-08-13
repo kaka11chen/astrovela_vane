@@ -25,6 +25,13 @@ public:
 
 struct ParquetMultiFileInfo : MultiFileReaderInterface {
 	static unique_ptr<MultiFileReaderInterface> CreateInterface(ClientContext &context);
+	//! Export and restore the Parquet-owned portion of a MultiFileBindData. Lakehouse
+	//! extensions that wrap parquet_scan use these helpers for their own bind serde.
+	DUCKDB_API static ParquetOptionsSerialization SerializeBindData(const MultiFileBindData &bind_data,
+	                                                                idx_t &initial_file_row_groups,
+	                                                                idx_t &initial_file_cardinality);
+	DUCKDB_API static void DeserializeBindData(MultiFileBindData &bind_data, ParquetOptionsSerialization serialization,
+	                                           idx_t initial_file_row_groups, idx_t initial_file_cardinality);
 
 	unique_ptr<BaseFileReaderOptions> InitializeOptions(ClientContext &context,
 	                                                    optional_ptr<TableFunctionInfo> info) override;

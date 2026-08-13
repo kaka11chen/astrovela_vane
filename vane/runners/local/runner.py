@@ -8,12 +8,11 @@ import os
 import sys
 import threading
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from numbers import Integral
 from typing import TYPE_CHECKING, Any
 
-from vane._ray_cxx import require_ray_cxx_attr
+from vane._ray_cxx import new_distributed_operation_id, require_ray_cxx_attr
 from vane._vane_session import ensure_vane_session_dir
 from vane.runners.copy_outcome import CopyOutcomeUnknownError
 from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
@@ -435,7 +434,7 @@ class LocalRunner(Runner):
         PyLogicalPlan = require_ray_cxx_attr("PyLogicalPlan")
         DistributedPhysicalPlanRunner = require_ray_cxx_attr("DistributedPhysicalPlanRunner")
 
-        query_id = str(uuid.uuid4())
+        query_id = new_distributed_operation_id()
         logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
         conn = vane.connect()
         fragment_executor = _InProcessFragmentExecutor()

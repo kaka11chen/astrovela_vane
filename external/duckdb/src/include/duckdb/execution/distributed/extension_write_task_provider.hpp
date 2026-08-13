@@ -16,7 +16,8 @@ namespace distributed {
 
 //! Stable coordinator identity for one distributed write operation. It remains
 //! available even when no worker result envelope was produced, so a provider
-//! can reconcile or abort the complete speculative artifact namespace.
+//! can abort the complete speculative artifact namespace and pass the identity
+//! to a catalog-native idempotency mechanism when one exists.
 struct DistributedWriteOperationContext {
 	string operation_id;
 
@@ -44,17 +45,35 @@ public:
 	//! Immutable extension/operator key and extension-owned worker bind envelope.
 	virtual const DistributedExtensionWritePlan &WritePlan() const = 0;
 
-	//! Validate coordinator/catalog state before any worker callback can run.
-	//! The stable operation identity may name an earlier attempt, so callback
-	//! providers must reconcile any durable operation state here without
-	//! committing the caller-owned transaction.
+	//! Expose a side-effect-free, serializable worker subtree before worker-plan
+	//! serialization or distributed translation. Submission preflight and
+	//! resource planning can inspect a physical write before Vane opens the
+	//! transaction used for execution, so this hook must not create catalog
+	//! entries or durable artifacts. It may only perform idempotent in-memory plan
+	//! rewrites.
+	virtual void PrepareDistributedWorkerPlan(ClientContext &context,
+	                                          const DistributedWriteOperationContext &operation) {
+	}
+
+	//! Prepare the coordinator-owned physical write before Vane translates its
+	//! worker subtree. Extensions can use this hook to resolve catalog state and
+	//! replace coordinator-only children with a serializable worker input. Any
+	//! operation-owned speculative artifacts created here must be removable
+	//! through AbortDistributedWrite; catalog preparation keeps the extension's
+	//! native transaction and recovery semantics.
+	virtual void PrepareDistributedWrite(ClientContext &context, const DistributedWriteOperationContext &operation) {
+	}
+
+	//! Validate current coordinator/catalog state before any worker callback can
+	//! run. This hook must not commit the caller-owned transaction.
 	virtual void ValidateDistributedWrite(ClientContext &context,
 	                                      const DistributedWriteOperationContext &operation) const = 0;
 
 	//! Register exactly the selected task results in the active coordinator
-	//! catalog transaction. Repeating the same operation must be idempotent,
-	//! including after an earlier commit response was lost. Returns the number
-	//! of affected rows represented by the selected results.
+	//! catalog transaction. Vane calls this hook once per execution attempt.
+	//! Catalog commit idempotency and optimistic concurrency remain properties of
+	//! the extension's native catalog protocol. Returns the number of affected
+	//! rows represented by the selected results.
 	virtual idx_t FinalizeDistributedWrite(ClientContext &context, const DistributedWriteOperationContext &operation,
 	                                       const vector<DistributedWriteTaskResult> &results) const = 0;
 

@@ -247,6 +247,7 @@ TEST_CASE("PhysicalPlanTranslator: extension write unwraps its COPY child", "[di
 	physical_plan->SetRoot(extension);
 
 	PlanConfig config;
+	config.query_id = "extension-write-copy-translation";
 	config.db = db.instance;
 	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
 	auto translated =
@@ -269,6 +270,7 @@ TEST_CASE("PhysicalPlanTranslator: callback extension write installs a worker si
 	unary.plan->SetRoot(extension);
 
 	PlanConfig config;
+	config.query_id = "extension-write-callback-translation";
 	config.db = db.instance;
 	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
 	auto write_info = ResolveDistributedExtensionWriteInfo(*connection.context, extension_write.WritePlan());
@@ -347,6 +349,7 @@ TEST_CASE("PhysicalPlanTranslator: extension write must be the physical plan roo
 	physical_plan->SetRoot(projection);
 
 	PlanConfig config;
+	config.query_id = "extension-write-nested-translation";
 	config.db = db.instance;
 	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
 	auto translated =
@@ -374,6 +377,7 @@ TEST_CASE("PhysicalPlanTranslator: extension write requires a non-empty name", "
 	physical_plan->SetRoot(extension);
 
 	PlanConfig config;
+	config.query_id = "extension-write-unnamed-translation";
 	config.db = db.instance;
 	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
 	auto translated =

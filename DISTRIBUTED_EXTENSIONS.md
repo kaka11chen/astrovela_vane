@@ -219,6 +219,26 @@ cannot override that static contract.
 contract before translation, task selection, or artifact creation. There is no
 mode inference: the physical shape must exactly match the declared mode.
 
+Before worker-subtree serialization and each translation pass, Vane calls
+`PrepareDistributedWorkerPlan`. The default implementation is a no-op. This
+hook may idempotently replace a coordinator-only child with a serializable
+worker input, but it must remain side-effect free because submission preflight
+and translation may run for planning or inspection outside write execution.
+After protocol validation and after opening Vane's auto-commit transaction,
+`PlanRunner` calls
+`PrepareDistributedWrite`. An extension may use that hook to resolve
+transaction-local catalog state and configure its native commit protocol. Any
+speculative artifacts created there must be addressable by the stable operation
+ID and removable by `AbortDistributedWrite` on a known pre-commit failure.
+
+Vane does not define a generic exactly-once catalog protocol. Extensions keep
+their native transaction, optimistic-concurrency, and request-idempotency
+semantics. For example, an Iceberg REST adapter can use the stable operation ID
+as an `Idempotency-Key` when the catalog advertises that capability. If a
+catalog does not provide a safe idempotency mechanism, the adapter must disable
+automatic mutation retries and redirect replays, and surface an ambiguous
+response as an unknown outcome.
+
 ### File-artifact mode
 
 `FILE_ARTIFACT` is the fixed adapter for extension operators whose single child
@@ -235,8 +255,11 @@ catalog must reference the exact immutable paths produced by workers. Before
 provider finalization, Vane persists a `catalog_commit_pending` lifecycle fence
 so age-based cleanup cannot delete files that a remote catalog may already
 reference. After the owned catalog transaction commits, Vane publishes the
-committed file marker. A retry with the same query identity returns that marker
-without invoking the provider again.
+committed file marker. A retry with the same stable operation identity can
+return that marker without worker execution, provider validation, or provider
+finalization. Provider preparation may run first when it is needed to
+reconstruct the stable COPY namespace. This engine-owned marker is not a
+catalog-generic exactly-once mechanism.
 
 ### Callback mode
 
@@ -271,53 +294,75 @@ Avro, protobuf, or other binary commit metadata inside the opaque payload while
 keeping Vane independent of that schema.
 
 Callback mode has no engine-owned publication marker because Vane cannot
-interpret the extension's catalog state. A retry therefore presents the same
-stable operation ID to the provider. `ValidateDistributedWrite` must reconcile
-any durable state from an earlier attempt, and `FinalizeDistributedWrite` must
-be idempotent for that operation, including when an earlier catalog commit
-succeeded but its response was lost.
+interpret the extension's catalog state. `ValidateDistributedWrite` checks the
+current target invariants, and `FinalizeDistributedWrite` registers exactly the
+selected artifacts once in the active transaction. Vane does not automatically
+replay a callback-mode catalog commit whose response was lost.
 
 ### Coordinator finalization
 
 Both modes use the same coordinator sequence:
 
-1. Validate the complete provider and worker protocol, passing the stable Vane
-   operation/query ID, before side effects.
-2. Execute worker sinks and select successful task attempts.
-3. Validate and aggregate their opaque result envelopes.
-4. Call `FinalizeDistributedWrite` with exactly the selected envelopes inside
+1. Establish the stable Vane operation/query ID, validate the provider shape,
+   call the side-effect-free `PrepareDistributedWorkerPlan`, and prove that the
+   resulting worker subtree is serializable before resource registration.
+2. Validate the complete provider and worker protocol, open Vane's owned
+   auto-commit transaction, arm abort cleanup, and call
+   `PrepareDistributedWrite`.
+3. During translation, call `PrepareDistributedWorkerPlan` again and translate
+   the prepared worker subtree.
+4. Execute worker sinks and select successful task attempts.
+5. Validate and aggregate their opaque result envelopes.
+6. Call `FinalizeDistributedWrite` with exactly the selected envelopes inside
    Vane's active coordinator transaction.
-5. Require the provider's affected-row count to match the envelope total.
-6. Commit through DuckDB's transaction manager.
-7. For `FILE_ARTIFACT`, publish the committed file marker after catalog commit.
+7. Require the provider's affected-row count to match the envelope total.
+8. Commit through DuckDB's transaction manager, using the extension/catalog's
+   native conflict and idempotency semantics.
+9. For `FILE_ARTIFACT`, publish the committed file marker after catalog
+    commit.
 
 `AbortDistributedWrite` is mandatory. Vane supplies the stable operation ID
 and invokes it once for known pre-commit failures, including cases where no
 result envelope was returned, so the provider must be able to locate
 operation-owned artifacts from coordinator state and deterministic identities.
-A catalog commit exception is an unknown
-outcome: Vane retains all opaque or file artifacts and does not call abort.
+A catalog commit exception is an unknown outcome to Vane: it does not call the
+provider abort hook or its distributed-output cleanup. The extension's native
+transaction may clean files only when it can prove no catalog mutation request
+was attempted; once a remote catalog may reference them, it must retain them. A
+committed engine-owned file marker can still prove that its file-publication
+lifecycle completed; Vane rolls back any current transaction-local preparation
+before returning that marker.
 
 Extension writes require DuckDB auto-commit mode. Vane owns that transaction
 boundary; an explicit caller-managed transaction is rejected before workers
 start because Vane could not safely publish a marker before the caller's later
-commit. File-artifact retries inspect the stable namespace before validation or
-worker scheduling. A valid committed marker returns the persisted result
-without invoking the provider again.
+commit. File-artifact retries inspect the stable engine namespace; a valid
+committed marker returns the persisted result without invoking provider
+validation or finalization.
+
+Python relation `insert`, `insert_into`, `update`, `delete`, and `create`
+(CTAS) expose only two explicit execution modes. `VANE_RUNNER=ray` always uses the
+distributed write path and propagates unsupported plans, bind failures, and
+execution failures without local fallback. `VANE_RUNNER=local-fast` executes
+directly in DuckDB as a separate backend. An unset or empty `VANE_RUNNER`, and
+the legacy `VANE_RUNNER=local` mode, are rejected for these mutation APIs.
 
 A worker, validation, provider, or other failure known to precede catalog
 commit rolls back the transaction and invokes explicit cleanup. If the catalog
-commit call itself fails, Vane retains the artifacts and reports an unknown
-outcome: a remote catalog may have committed before its response was lost.
-Failure to publish the file-mode marker after a known successful catalog commit
-is also reported as an unknown output-lifecycle outcome because the committed
-catalog transaction cannot be rolled back.
+commit call itself fails, Vane skips provider abort and distributed-output
+cleanup and reports an unknown outcome. The extension's native transaction
+decides whether the mutation was never attempted and can be rolled back, or may
+have committed and therefore requires artifact retention. Failure to publish
+the file-mode marker after a known successful catalog commit is also reported
+as an unknown output-lifecycle outcome because the committed catalog
+transaction cannot be rolled back.
 
 A file-mode prepared manifest without a committed marker is therefore not
 retryable by the generic engine. Vane retains its files and rejects automatic
 replay because it cannot prove whether a remote catalog committed before its
-response was lost. Extension-specific reconciliation may establish that
-outcome separately.
+response was lost. The extension or catalog may expose its own out-of-band
+status and recovery workflow, but that is not part of Vane's write-provider
+contract.
 
 ## Extension author contract
 
@@ -349,8 +394,8 @@ For every distributed write provider:
 - reconcile the operation-owned task-attempt namespace against those selected
   envelopes and remove artifacts from unselected or retried attempts before
   registering catalog state;
-- make validation and finalization idempotent for a repeated operation ID and
-  reconcile an earlier ambiguous callback-mode commit before new workers run;
+- call the catalog's native idempotency mechanism when it is explicitly
+  advertised, and disable unsafe automatic mutation retries otherwise;
 - register their files or opaque fragments in the active coordinator
   transaction without committing it;
 - return the exact affected row count;
@@ -398,6 +443,9 @@ distributed tests before an extension is enabled in release builds.
   have exactly one registered callback sink.
 - Extension writes must use direct worker artifacts and explicit coordinator
   finalization.
+- The Ray coordinator actor has actor restart and actor-task retry disabled for
+  write submission. An ambiguous client RPC performs only bounded, read-only
+  outcome recovery and never resubmits the provider callback.
 - Extension writes reject explicit DuckDB transactions and ambiguous catalog
   commits never trigger destructive artifact cleanup.
 

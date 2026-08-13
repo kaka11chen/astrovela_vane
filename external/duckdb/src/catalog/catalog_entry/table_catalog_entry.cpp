@@ -104,6 +104,15 @@ unique_ptr<CreateInfo> TableCatalogEntry::GetInfo() const {
 	return std::move(result);
 }
 
+void TableCatalogEntry::VerifyLogicalWriteTargetIdentity(const string &serialized_identity) const {
+	auto current_identity = GetLogicalWriteTargetIdentity();
+	if (serialized_identity == current_identity) {
+		return;
+	}
+	throw CatalogException("Table %s.%s.%s was replaced after the logical write plan was serialized", catalog.GetName(),
+	                       schema.name, name);
+}
+
 string TableCatalogEntry::ColumnsToSQL(const ColumnList &columns, const vector<unique_ptr<Constraint>> &constraints) {
 	duckdb::stringstream ss;
 
