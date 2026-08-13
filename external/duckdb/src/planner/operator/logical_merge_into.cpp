@@ -10,10 +10,12 @@ LogicalMergeInto::LogicalMergeInto(TableCatalogEntry &table)
     : LogicalOperator(LogicalOperatorType::LOGICAL_MERGE_INTO), table(table) {
 }
 
-LogicalMergeInto::LogicalMergeInto(ClientContext &context, const unique_ptr<CreateInfo> &table_info)
+LogicalMergeInto::LogicalMergeInto(ClientContext &context, const unique_ptr<CreateInfo> &table_info,
+                                   string serialized_table_identity)
     : LogicalOperator(LogicalOperatorType::LOGICAL_MERGE_INTO),
       table(Catalog::GetEntry<TableCatalogEntry>(context, table_info->catalog, table_info->schema,
                                                  table_info->Cast<CreateTableInfo>().table)) {
+	table.VerifyLogicalWriteTargetIdentity(serialized_table_identity);
 	auto binder = Binder::CreateBinder(context);
 	bound_constraints = binder->BindConstraints(table);
 }

@@ -1061,6 +1061,7 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	std::shared_ptr<duckdb::PhysicalPlan> physical_plan;
 	auto &context = *conn_wrapper.con.GetConnection().context;
 	context.RunFunctionInTransaction([&]() {
+		duckdb::distributed::ScopedDistributedPlanningState distributed_planning(context, query_id_);
 		duckdb::MemoryStream stream(duckdb::Allocator::Get(context));
 		stream.WriteData(reinterpret_cast<const uint8_t *>(logical_payload.data()), logical_payload.size());
 		stream.Rewind();
@@ -1503,6 +1504,23 @@ public:
 			outputs.push_back(std::move(output));
 		}
 		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::ok(std::move(outputs));
+	}
+
+	DuckDBResult<void> quiesce_fte_query(const string &query_id) override {
+		if (query_id.empty()) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::value_error("Python backend FTE query quiescence requires non-empty query_id"));
+		}
+		try {
+			drop_query_fragments(query_id);
+			return DuckDBResult<void>::ok();
+		} catch (const std::exception &ex) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::external_error(string("failed to quiesce Python backend FTE query: ") + ex.what()));
+		} catch (...) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::external_error("failed to quiesce Python backend FTE query: unknown error"));
+		}
 	}
 
 	void drop_query_fragments(const string &query_id) {
@@ -2715,6 +2733,7 @@ struct PyPhysicalPlanWrapperRunner {
 		bool body_succeeded = false;
 		bool query_owner_registered = false;
 		std::exception_ptr cleanup_error;
+		std::vector<string> post_commit_warnings;
 		auto exception_message = [](const std::exception_ptr &error) {
 			try {
 				std::rethrow_exception(error);
@@ -2772,20 +2791,43 @@ struct PyPhysicalPlanWrapperRunner {
 				py::gil_scoped_release release;
 				DuckDBResult<duckdb::distributed::PlanRunner::PlanResult> plan_res;
 				std::exception_ptr extension_catalog_commit_error;
+				bool committed_replay_rollback_requested = false;
 				if (!client_context) {
 					plan_res = runner->run_plan(plan.plan_);
 				} else {
-					class PlanResultRollbackException final : public std::exception {};
+					class PlanResultErrorRollbackException final : public std::exception {};
+					class PlanResultCommittedReplayRollbackException final : public std::exception {};
 					try {
 						client_context->RunFunctionInTransaction([&]() {
 							plan_res = runner->run_plan(plan.plan_);
 							if (plan_res.is_err()) {
-								throw PlanResultRollbackException();
+								throw PlanResultErrorRollbackException();
+							}
+							if (plan_res.value().tag == duckdb::distributed::PlanRunner::PlanResult::EXTENSION_WRITE &&
+							    plan_res.value().extension_write_result.catalog_committed) {
+								// Reconciliation or an engine-owned committed marker proved
+								// that an earlier attempt committed. Preparation may still
+								// have created transaction-local state (notably a CTAS target
+								// needed to reconstruct its stable output path). Return the
+								// historical result, but never commit those replay-side
+								// effects into the current transaction.
+								committed_replay_rollback_requested = true;
+								throw PlanResultCommittedReplayRollbackException();
 							}
 						});
-					} catch (const PlanResultRollbackException &) {
+					} catch (const PlanResultErrorRollbackException &) {
 						D_ASSERT(plan_res.is_err());
+					} catch (const PlanResultCommittedReplayRollbackException &) {
+						D_ASSERT(plan_res.is_ok());
+						D_ASSERT(plan_res.value().tag == duckdb::distributed::PlanRunner::PlanResult::EXTENSION_WRITE);
+						D_ASSERT(plan_res.value().extension_write_result.catalog_committed);
 					} catch (...) {
+						if (committed_replay_rollback_requested) {
+							// The replay sentinel itself is handled above. Reaching this
+							// branch means transaction rollback replaced it with another
+							// exception; never suppress a failed rollback as replay success.
+							throw;
+						}
 						if (plan_res.is_ok() &&
 						    plan_res.value().tag == duckdb::distributed::PlanRunner::PlanResult::EXTENSION_WRITE) {
 							if (!plan_res.value().extension_write_result.catalog_committed) {
@@ -2847,6 +2889,30 @@ struct PyPhysicalPlanWrapperRunner {
 								}
 							}
 						}
+						if (extension_result.catalog_committed) {
+							try {
+								auto provider = plan.plan_->physical_plan()->Root().GetExtensionWriteTaskProvider();
+								if (!provider) {
+									throw InternalException(
+									    "committed distributed extension write lost its task provider");
+								}
+								DistributedWriteOperationContext operation;
+								operation.operation_id = plan.plan_->query_id();
+								operation.Validate();
+								// The catalog write transaction is already definitively committed (or
+								// the replay transaction was deliberately rolled back). Open a fresh
+								// transaction so context-scoped filesystem and secret providers remain
+								// usable while the hook removes only post-commit auxiliary state.
+								client_context->RunFunctionInTransaction([&]() {
+									provider->ConfirmDistributedWriteCommit(*client_context, operation,
+									                                        extension_result.selected_task_results);
+								});
+							} catch (...) {
+								post_commit_warnings.push_back(
+								    "extension catalog committed, but post-commit cleanup failed: " +
+								    exception_message(std::current_exception()));
+							}
+						}
 						if (extension_result.info.mode == DistributedWriteMode::FILE_ARTIFACT) {
 							res = DuckDBResult<DistributedCopyResult>::ok(extension_result.file_result);
 						} else {
@@ -2880,7 +2946,6 @@ struct PyPhysicalPlanWrapperRunner {
 				rethrow_submission_error(plan.idx());
 				throw py::value_error("distributed COPY completed without a committed output marker");
 			}
-			std::vector<string> post_commit_warnings;
 			try {
 				rethrow_submission_error(plan.idx());
 			} catch (...) {

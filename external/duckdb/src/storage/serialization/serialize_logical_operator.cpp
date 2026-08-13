@@ -118,9 +118,6 @@ unique_ptr<LogicalOperator> LogicalOperator::Deserialize(Deserializer &deseriali
 	case LogicalOperatorType::LOGICAL_FILTER:
 		result = LogicalFilter::Deserialize(deserializer);
 		break;
-	case LogicalOperatorType::LOGICAL_REPARTITION:
-		result = LogicalRepartition::Deserialize(deserializer);
-		break;
 	case LogicalOperatorType::LOGICAL_GET:
 		result = LogicalGet::Deserialize(deserializer);
 		break;
@@ -135,6 +132,9 @@ unique_ptr<LogicalOperator> LogicalOperator::Deserialize(Deserializer &deseriali
 		break;
 	case LogicalOperatorType::LOGICAL_LOAD:
 		result = LogicalSimple::Deserialize(deserializer);
+		break;
+	case LogicalOperatorType::LOGICAL_LOCAL_EXCHANGE:
+		result = LogicalLocalExchange::Deserialize(deserializer);
 		break;
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
 		result = LogicalMaterializedCTE::Deserialize(deserializer);
@@ -154,17 +154,11 @@ unique_ptr<LogicalOperator> LogicalOperator::Deserialize(Deserializer &deseriali
 	case LogicalOperatorType::LOGICAL_PROJECTION:
 		result = LogicalProjection::Deserialize(deserializer);
 		break;
-	case LogicalOperatorType::LOGICAL_VLLM_PROJECT:
-		result = LogicalVLLMProject::Deserialize(deserializer);
-		break;
-	case LogicalOperatorType::LOGICAL_UDF_PROJECT:
-		result = LogicalUDFProject::Deserialize(deserializer);
-		break;
-	case LogicalOperatorType::LOGICAL_LOCAL_EXCHANGE:
-		result = LogicalLocalExchange::Deserialize(deserializer);
-		break;
 	case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
 		result = LogicalRecursiveCTE::Deserialize(deserializer);
+		break;
+	case LogicalOperatorType::LOGICAL_REPARTITION:
+		result = LogicalRepartition::Deserialize(deserializer);
 		break;
 	case LogicalOperatorType::LOGICAL_RESET:
 		result = LogicalReset::Deserialize(deserializer);
@@ -181,6 +175,9 @@ unique_ptr<LogicalOperator> LogicalOperator::Deserialize(Deserializer &deseriali
 	case LogicalOperatorType::LOGICAL_TRANSACTION:
 		result = LogicalSimple::Deserialize(deserializer);
 		break;
+	case LogicalOperatorType::LOGICAL_UDF_PROJECT:
+		result = LogicalUDFProject::Deserialize(deserializer);
+		break;
 	case LogicalOperatorType::LOGICAL_UNION:
 		result = LogicalSetOperation::Deserialize(deserializer);
 		break;
@@ -193,12 +190,14 @@ unique_ptr<LogicalOperator> LogicalOperator::Deserialize(Deserializer &deseriali
 	case LogicalOperatorType::LOGICAL_VACUUM:
 		result = LogicalVacuum::Deserialize(deserializer);
 		break;
+	case LogicalOperatorType::LOGICAL_VLLM_PROJECT:
+		result = LogicalVLLMProject::Deserialize(deserializer);
+		break;
 	case LogicalOperatorType::LOGICAL_WINDOW:
 		result = LogicalWindow::Deserialize(deserializer);
 		break;
 	default:
-		throw SerializationException("Unsupported type for deserialization of LogicalOperator: %s (enum=%d)!",
-		                             EnumUtil::ToString(type).c_str(), static_cast<int>(type));
+		throw SerializationException("Unsupported type for deserialization of LogicalOperator!");
 	}
 	deserializer.Unset<LogicalOperatorType>();
 	result->children = std::move(children);
@@ -423,14 +422,21 @@ void LogicalDelete::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<idx_t>(201, "table_index", table_index);
 	serializer.WritePropertyWithDefault<bool>(202, "return_chunk", return_chunk);
 	serializer.WritePropertyWithDefault<vector<unique_ptr<Expression>>>(203, "expressions", expressions);
+	if (serializer.ShouldSerialize(7)) {
+		serializer.WritePropertyWithDefault<string>(204, "serialized_table_identity", table.GetLogicalWriteTargetIdentity());
+	}
 }
 
 unique_ptr<LogicalOperator> LogicalDelete::Deserialize(Deserializer &deserializer) {
 	auto table_info = deserializer.ReadPropertyWithDefault<unique_ptr<CreateInfo>>(200, "table_info");
-	auto result = duckdb::unique_ptr<LogicalDelete>(new LogicalDelete(deserializer.Get<ClientContext &>(), table_info));
-	deserializer.ReadPropertyWithDefault<idx_t>(201, "table_index", result->table_index);
-	deserializer.ReadPropertyWithDefault<bool>(202, "return_chunk", result->return_chunk);
-	deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(203, "expressions", result->expressions);
+	auto table_index = deserializer.ReadPropertyWithDefault<idx_t>(201, "table_index");
+	auto return_chunk = deserializer.ReadPropertyWithDefault<bool>(202, "return_chunk");
+	auto expressions = deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(203, "expressions");
+	auto serialized_table_identity = deserializer.ReadPropertyWithDefault<string>(204, "serialized_table_identity");
+	auto result = duckdb::unique_ptr<LogicalDelete>(new LogicalDelete(deserializer.Get<ClientContext &>(), table_info, std::move(serialized_table_identity)));
+	result->table_index = table_index;
+	result->return_chunk = return_chunk;
+	result->expressions = std::move(expressions);
 	return std::move(result);
 }
 
@@ -544,115 +550,6 @@ unique_ptr<LogicalOperator> LogicalFilter::Deserialize(Deserializer &deserialize
 	return std::move(result);
 }
 
-void LogicalRepartition::Serialize(Serializer &serializer) const {
-	LogicalOperator::Serialize(serializer);
-	auto repartition_type =
-	    repartition_spec ? static_cast<uint8_t>(repartition_spec->type())
-	                     : static_cast<uint8_t>(RepartitionSpec::Type::Random);
-	serializer.WriteProperty<uint8_t>(200, "repartition_type", repartition_type);
-
-	optional_idx num_partitions;
-	vector<unique_ptr<Expression>> partition_by;
-
-	if (!expressions.empty()) {
-		partition_by.reserve(expressions.size());
-		for (auto &expr : expressions) {
-			partition_by.push_back(expr->Copy());
-		}
-	}
-
-	if (repartition_spec) {
-		switch (static_cast<RepartitionSpec::Type>(repartition_type)) {
-		case RepartitionSpec::Type::Hash: {
-			auto *hash_spec = dynamic_cast<HashRepartitionSpec *>(repartition_spec.get());
-			if (!hash_spec) {
-				throw InternalException("Expected HashRepartitionSpec for LOGICAL_REPARTITION");
-			}
-			auto &config = hash_spec->config();
-			if (config->num_partitions) {
-				num_partitions = optional_idx(static_cast<idx_t>(config->num_partitions));
-			}
-			break;
-		}
-		case RepartitionSpec::Type::Random: {
-			auto *random_spec = dynamic_cast<RandomRepartitionSpec *>(repartition_spec.get());
-			if (!random_spec) {
-				throw InternalException("Expected RandomRepartitionSpec for LOGICAL_REPARTITION");
-			}
-			auto &config = random_spec->config();
-			if (config->num_partitions) {
-				num_partitions = optional_idx(static_cast<idx_t>(config->num_partitions));
-			}
-			break;
-		}
-		case RepartitionSpec::Type::IntoPartitions: {
-			auto *into_spec = dynamic_cast<IntoPartitionsRepartitionSpec *>(repartition_spec.get());
-			if (!into_spec) {
-				throw InternalException("Expected IntoPartitionsRepartitionSpec for LOGICAL_REPARTITION");
-			}
-			auto &config = into_spec->config();
-			num_partitions = optional_idx(static_cast<idx_t>(config->num_partitions));
-			break;
-		}
-		case RepartitionSpec::Type::Range:
-			throw NotImplementedException("Range repartition serialization is not supported");
-		}
-	}
-
-	serializer.WritePropertyWithDefault<optional_idx>(201, "num_partitions", num_partitions);
-	serializer.WritePropertyWithDefault<vector<unique_ptr<Expression>>>(202, "partition_by", partition_by);
-}
-
-unique_ptr<LogicalOperator> LogicalRepartition::Deserialize(Deserializer &deserializer) {
-	auto repartition_type_val = deserializer.ReadProperty<uint8_t>(200, "repartition_type");
-	auto num_partitions = deserializer.ReadPropertyWithDefault<optional_idx>(201, "num_partitions");
-	auto partition_by = deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(202, "partition_by");
-
-	size_t num_partitions_val = 0;
-	if (num_partitions.IsValid()) {
-		num_partitions_val = static_cast<size_t>(num_partitions.GetIndex());
-	}
-
-	vector<unique_ptr<Expression>> bound_partition_exprs;
-	if (!partition_by.empty()) {
-		bound_partition_exprs.reserve(partition_by.size());
-		for (auto &expr : partition_by) {
-			bound_partition_exprs.push_back(expr->Copy());
-		}
-	}
-
-	std::shared_ptr<RepartitionSpec> spec;
-	auto repartition_type = static_cast<RepartitionSpec::Type>(repartition_type_val);
-	switch (repartition_type) {
-	case RepartitionSpec::Type::Hash: {
-		vector<ExprRef> expr_refs;
-		expr_refs.reserve(partition_by.size());
-		for (auto &expr : partition_by) {
-			expr_refs.emplace_back(expr.release());
-		}
-		spec = RepartitionSpec::create_hash(num_partitions_val, std::move(expr_refs));
-		break;
-	}
-	case RepartitionSpec::Type::Random:
-		spec = RepartitionSpec::create_random(num_partitions_val);
-		break;
-	case RepartitionSpec::Type::IntoPartitions:
-		if (!num_partitions_val) {
-			throw InternalException("Missing num_partitions for IntoPartitions repartition");
-		}
-		spec = RepartitionSpec::create_into_partitions(num_partitions_val);
-		break;
-	case RepartitionSpec::Type::Range:
-		throw NotImplementedException("Range repartition deserialization is not supported");
-	default:
-		throw InternalException("Unknown repartition type for LOGICAL_REPARTITION");
-	}
-
-	auto result = duckdb::unique_ptr<LogicalRepartition>(new LogicalRepartition(std::move(spec)));
-	result->expressions = std::move(bound_partition_exprs);
-	return std::move(result);
-}
-
 void LogicalInsert::Serialize(Serializer &serializer) const {
 	LogicalOperator::Serialize(serializer);
 	serializer.WritePropertyWithDefault<unique_ptr<CreateInfo>>(200, "table_info", table.GetInfo());
@@ -674,29 +571,51 @@ void LogicalInsert::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<vector<column_t>>(216, "source_columns", on_conflict_info.source_columns);
 	serializer.WritePropertyWithDefault<vector<unique_ptr<Expression>>>(217, "expressions", expressions);
 	serializer.WritePropertyWithDefault<bool>(218, "update_is_del_and_insert", on_conflict_info.update_is_del_and_insert, false);
+	if (serializer.ShouldSerialize(7)) {
+		serializer.WritePropertyWithDefault<string>(219, "serialized_table_identity", table.GetLogicalWriteTargetIdentity());
+	}
 }
 
 unique_ptr<LogicalOperator> LogicalInsert::Deserialize(Deserializer &deserializer) {
 	auto table_info = deserializer.ReadPropertyWithDefault<unique_ptr<CreateInfo>>(200, "table_info");
-	auto result = duckdb::unique_ptr<LogicalInsert>(new LogicalInsert(deserializer.Get<ClientContext &>(), std::move(table_info)));
-	deserializer.ReadPropertyWithDefault<vector<vector<unique_ptr<Expression>>>>(201, "insert_values", result->insert_values);
-	deserializer.ReadProperty<IndexVector<idx_t, PhysicalIndex>>(202, "column_index_map", result->column_index_map);
-	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(203, "expected_types", result->expected_types);
-	deserializer.ReadPropertyWithDefault<idx_t>(204, "table_index", result->table_index);
-	deserializer.ReadPropertyWithDefault<bool>(205, "return_chunk", result->return_chunk);
-	deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(206, "bound_defaults", result->bound_defaults);
-	deserializer.ReadProperty<OnConflictAction>(207, "action_type", result->on_conflict_info.action_type);
-	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(208, "expected_set_types", result->on_conflict_info.expected_set_types);
-	deserializer.ReadPropertyWithDefault<unordered_set<idx_t>>(209, "on_conflict_filter", result->on_conflict_info.on_conflict_filter);
-	deserializer.ReadPropertyWithDefault<unique_ptr<Expression>>(210, "on_conflict_condition", result->on_conflict_info.on_conflict_condition);
-	deserializer.ReadPropertyWithDefault<unique_ptr<Expression>>(211, "do_update_condition", result->on_conflict_info.do_update_condition);
-	deserializer.ReadPropertyWithDefault<vector<PhysicalIndex>>(212, "set_columns", result->on_conflict_info.set_columns);
-	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(213, "set_types", result->on_conflict_info.set_types);
-	deserializer.ReadPropertyWithDefault<idx_t>(214, "excluded_table_index", result->on_conflict_info.excluded_table_index);
-	deserializer.ReadPropertyWithDefault<vector<column_t>>(215, "columns_to_fetch", result->on_conflict_info.columns_to_fetch);
-	deserializer.ReadPropertyWithDefault<vector<column_t>>(216, "source_columns", result->on_conflict_info.source_columns);
-	deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(217, "expressions", result->expressions);
-	deserializer.ReadPropertyWithExplicitDefault<bool>(218, "update_is_del_and_insert", result->on_conflict_info.update_is_del_and_insert, false);
+	auto insert_values = deserializer.ReadPropertyWithDefault<vector<vector<unique_ptr<Expression>>>>(201, "insert_values");
+	auto column_index_map = deserializer.ReadProperty<IndexVector<idx_t, PhysicalIndex>>(202, "column_index_map");
+	auto expected_types = deserializer.ReadPropertyWithDefault<vector<LogicalType>>(203, "expected_types");
+	auto table_index = deserializer.ReadPropertyWithDefault<idx_t>(204, "table_index");
+	auto return_chunk = deserializer.ReadPropertyWithDefault<bool>(205, "return_chunk");
+	auto bound_defaults = deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(206, "bound_defaults");
+	auto on_conflict_info_action_type = deserializer.ReadProperty<OnConflictAction>(207, "action_type");
+	auto on_conflict_info_expected_set_types = deserializer.ReadPropertyWithDefault<vector<LogicalType>>(208, "expected_set_types");
+	auto on_conflict_info_on_conflict_filter = deserializer.ReadPropertyWithDefault<unordered_set<idx_t>>(209, "on_conflict_filter");
+	auto on_conflict_info_on_conflict_condition = deserializer.ReadPropertyWithDefault<unique_ptr<Expression>>(210, "on_conflict_condition");
+	auto on_conflict_info_do_update_condition = deserializer.ReadPropertyWithDefault<unique_ptr<Expression>>(211, "do_update_condition");
+	auto on_conflict_info_set_columns = deserializer.ReadPropertyWithDefault<vector<PhysicalIndex>>(212, "set_columns");
+	auto on_conflict_info_set_types = deserializer.ReadPropertyWithDefault<vector<LogicalType>>(213, "set_types");
+	auto on_conflict_info_excluded_table_index = deserializer.ReadPropertyWithDefault<idx_t>(214, "excluded_table_index");
+	auto on_conflict_info_columns_to_fetch = deserializer.ReadPropertyWithDefault<vector<column_t>>(215, "columns_to_fetch");
+	auto on_conflict_info_source_columns = deserializer.ReadPropertyWithDefault<vector<column_t>>(216, "source_columns");
+	auto expressions = deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(217, "expressions");
+	auto on_conflict_info_update_is_del_and_insert = deserializer.ReadPropertyWithExplicitDefault<bool>(218, "update_is_del_and_insert", false);
+	auto serialized_table_identity = deserializer.ReadPropertyWithDefault<string>(219, "serialized_table_identity");
+	auto result = duckdb::unique_ptr<LogicalInsert>(new LogicalInsert(deserializer.Get<ClientContext &>(), std::move(table_info), std::move(serialized_table_identity)));
+	result->insert_values = std::move(insert_values);
+	result->column_index_map = std::move(column_index_map);
+	result->expected_types = std::move(expected_types);
+	result->table_index = table_index;
+	result->return_chunk = return_chunk;
+	result->bound_defaults = std::move(bound_defaults);
+	result->on_conflict_info.action_type = on_conflict_info_action_type;
+	result->on_conflict_info.expected_set_types = std::move(on_conflict_info_expected_set_types);
+	result->on_conflict_info.on_conflict_filter = std::move(on_conflict_info_on_conflict_filter);
+	result->on_conflict_info.on_conflict_condition = std::move(on_conflict_info_on_conflict_condition);
+	result->on_conflict_info.do_update_condition = std::move(on_conflict_info_do_update_condition);
+	result->on_conflict_info.set_columns = std::move(on_conflict_info_set_columns);
+	result->on_conflict_info.set_types = std::move(on_conflict_info_set_types);
+	result->on_conflict_info.excluded_table_index = on_conflict_info_excluded_table_index;
+	result->on_conflict_info.columns_to_fetch = std::move(on_conflict_info_columns_to_fetch);
+	result->on_conflict_info.source_columns = std::move(on_conflict_info_source_columns);
+	result->expressions = std::move(expressions);
+	result->on_conflict_info.update_is_del_and_insert = on_conflict_info_update_is_del_and_insert;
 	return std::move(result);
 }
 
@@ -739,17 +658,27 @@ void LogicalMergeInto::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty<optional_idx>(204, "source_marker", source_marker);
 	serializer.WritePropertyWithDefault<map<MergeActionCondition, vector<unique_ptr<BoundMergeIntoAction>>>>(205, "actions", actions);
 	serializer.WritePropertyWithDefault<bool>(206, "return_chunk", return_chunk);
+	if (serializer.ShouldSerialize(7)) {
+		serializer.WritePropertyWithDefault<string>(207, "serialized_table_identity", table.GetLogicalWriteTargetIdentity());
+	}
 }
 
 unique_ptr<LogicalOperator> LogicalMergeInto::Deserialize(Deserializer &deserializer) {
 	auto table_info = deserializer.ReadPropertyWithDefault<unique_ptr<CreateInfo>>(200, "table_info");
-	auto result = duckdb::unique_ptr<LogicalMergeInto>(new LogicalMergeInto(deserializer.Get<ClientContext &>(), table_info));
-	deserializer.ReadPropertyWithDefault<idx_t>(201, "table_index", result->table_index);
-	deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(202, "bound_defaults", result->bound_defaults);
-	deserializer.ReadPropertyWithDefault<idx_t>(203, "row_id_start", result->row_id_start);
-	deserializer.ReadProperty<optional_idx>(204, "source_marker", result->source_marker);
-	deserializer.ReadPropertyWithDefault<map<MergeActionCondition, vector<unique_ptr<BoundMergeIntoAction>>>>(205, "actions", result->actions);
-	deserializer.ReadPropertyWithDefault<bool>(206, "return_chunk", result->return_chunk);
+	auto table_index = deserializer.ReadPropertyWithDefault<idx_t>(201, "table_index");
+	auto bound_defaults = deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(202, "bound_defaults");
+	auto row_id_start = deserializer.ReadPropertyWithDefault<idx_t>(203, "row_id_start");
+	auto source_marker = deserializer.ReadProperty<optional_idx>(204, "source_marker");
+	auto actions = deserializer.ReadPropertyWithDefault<map<MergeActionCondition, vector<unique_ptr<BoundMergeIntoAction>>>>(205, "actions");
+	auto return_chunk = deserializer.ReadPropertyWithDefault<bool>(206, "return_chunk");
+	auto serialized_table_identity = deserializer.ReadPropertyWithDefault<string>(207, "serialized_table_identity");
+	auto result = duckdb::unique_ptr<LogicalMergeInto>(new LogicalMergeInto(deserializer.Get<ClientContext &>(), table_info, std::move(serialized_table_identity)));
+	result->table_index = table_index;
+	result->bound_defaults = std::move(bound_defaults);
+	result->row_id_start = row_id_start;
+	result->source_marker = source_marker;
+	result->actions = std::move(actions);
+	result->return_chunk = return_chunk;
 	return std::move(result);
 }
 
@@ -798,47 +727,6 @@ unique_ptr<LogicalOperator> LogicalProjection::Deserialize(Deserializer &deseria
 	auto table_index = deserializer.ReadPropertyWithDefault<idx_t>(200, "table_index");
 	auto expressions = deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(201, "expressions");
 	auto result = duckdb::unique_ptr<LogicalProjection>(new LogicalProjection(table_index, std::move(expressions)));
-	return std::move(result);
-}
-
-void LogicalVLLMProject::Serialize(Serializer &serializer) const {
-	LogicalOperator::Serialize(serializer);
-	serializer.WritePropertyWithDefault<idx_t>(200, "table_index", table_index);
-	serializer.WritePropertyWithDefault<unique_ptr<Expression>>(201, "vllm_expr", vllm_expr);
-	serializer.WritePropertyWithDefault<string>(202, "output_column_name", output_column_name);
-}
-
-unique_ptr<LogicalOperator> LogicalVLLMProject::Deserialize(Deserializer &deserializer) {
-	auto table_index = deserializer.ReadPropertyWithDefault<idx_t>(200, "table_index");
-	auto vllm_expr = deserializer.ReadPropertyWithDefault<unique_ptr<Expression>>(201, "vllm_expr");
-	auto output_column_name = deserializer.ReadPropertyWithDefault<string>(202, "output_column_name");
-	auto result = duckdb::unique_ptr<LogicalVLLMProject>(new LogicalVLLMProject(table_index, std::move(vllm_expr), std::move(output_column_name)));
-	return std::move(result);
-}
-
-void LogicalUDFProject::Serialize(Serializer &serializer) const {
-	LogicalOperator::Serialize(serializer);
-	serializer.WritePropertyWithDefault<idx_t>(200, "table_index", table_index);
-	serializer.WritePropertyWithDefault<unique_ptr<Expression>>(201, "udf_expr", udf_expr);
-	serializer.WritePropertyWithDefault<string>(202, "output_column_name", output_column_name);
-	serializer.WritePropertyWithDefault<bool>(203, "is_flat_map", is_flat_map);
-	serializer.WritePropertyWithDefault<vector<LogicalType>>(204, "flat_map_output_types", flat_map_output_types);
-	serializer.WritePropertyWithDefault<vector<string>>(205, "flat_map_output_names", flat_map_output_names);
-	serializer.WritePropertyWithDefault<bool>(206, "is_scalar_map", is_scalar_map);
-	serializer.WritePropertyWithDefault<bool>(207, "is_row_preserving_batch", is_row_preserving_batch);
-}
-
-unique_ptr<LogicalOperator> LogicalUDFProject::Deserialize(Deserializer &deserializer) {
-	auto table_index = deserializer.ReadPropertyWithDefault<idx_t>(200, "table_index");
-	auto udf_expr = deserializer.ReadPropertyWithDefault<unique_ptr<Expression>>(201, "udf_expr");
-	auto output_column_name = deserializer.ReadPropertyWithDefault<string>(202, "output_column_name");
-	auto result = duckdb::unique_ptr<LogicalUDFProject>(
-	    new LogicalUDFProject(table_index, std::move(udf_expr), std::move(output_column_name)));
-	result->is_flat_map = deserializer.ReadPropertyWithDefault<bool>(203, "is_flat_map");
-	result->flat_map_output_types = deserializer.ReadPropertyWithDefault<vector<LogicalType>>(204, "flat_map_output_types");
-	result->flat_map_output_names = deserializer.ReadPropertyWithDefault<vector<string>>(205, "flat_map_output_names");
-	result->is_scalar_map = deserializer.ReadPropertyWithDefault<bool>(206, "is_scalar_map");
-	result->is_row_preserving_batch = deserializer.ReadPropertyWithDefault<bool>(207, "is_row_preserving_batch");
 	return std::move(result);
 }
 
@@ -945,6 +833,31 @@ unique_ptr<LogicalOperator> LogicalTopN::Deserialize(Deserializer &deserializer)
 	return std::move(result);
 }
 
+void LogicalUDFProject::Serialize(Serializer &serializer) const {
+	LogicalOperator::Serialize(serializer);
+	serializer.WritePropertyWithDefault<idx_t>(200, "table_index", table_index);
+	serializer.WritePropertyWithDefault<unique_ptr<Expression>>(201, "udf_expr", udf_expr);
+	serializer.WritePropertyWithDefault<string>(202, "output_column_name", output_column_name);
+	serializer.WritePropertyWithDefault<bool>(203, "is_flat_map", is_flat_map);
+	serializer.WritePropertyWithDefault<vector<LogicalType>>(204, "flat_map_output_types", flat_map_output_types);
+	serializer.WritePropertyWithDefault<vector<string>>(205, "flat_map_output_names", flat_map_output_names);
+	serializer.WritePropertyWithDefault<bool>(206, "is_scalar_map", is_scalar_map);
+	serializer.WritePropertyWithDefault<bool>(207, "is_row_preserving_batch", is_row_preserving_batch);
+}
+
+unique_ptr<LogicalOperator> LogicalUDFProject::Deserialize(Deserializer &deserializer) {
+	auto table_index = deserializer.ReadPropertyWithDefault<idx_t>(200, "table_index");
+	auto udf_expr = deserializer.ReadPropertyWithDefault<unique_ptr<Expression>>(201, "udf_expr");
+	auto output_column_name = deserializer.ReadPropertyWithDefault<string>(202, "output_column_name");
+	auto result = duckdb::unique_ptr<LogicalUDFProject>(new LogicalUDFProject(table_index, std::move(udf_expr), std::move(output_column_name)));
+	deserializer.ReadPropertyWithDefault<bool>(203, "is_flat_map", result->is_flat_map);
+	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(204, "flat_map_output_types", result->flat_map_output_types);
+	deserializer.ReadPropertyWithDefault<vector<string>>(205, "flat_map_output_names", result->flat_map_output_names);
+	deserializer.ReadPropertyWithDefault<bool>(206, "is_scalar_map", result->is_scalar_map);
+	deserializer.ReadPropertyWithDefault<bool>(207, "is_row_preserving_batch", result->is_row_preserving_batch);
+	return std::move(result);
+}
+
 void LogicalUnnest::Serialize(Serializer &serializer) const {
 	LogicalOperator::Serialize(serializer);
 	serializer.WritePropertyWithDefault<idx_t>(200, "unnest_index", unnest_index);
@@ -967,17 +880,42 @@ void LogicalUpdate::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<vector<PhysicalIndex>>(204, "columns", columns);
 	serializer.WritePropertyWithDefault<vector<unique_ptr<Expression>>>(205, "bound_defaults", bound_defaults);
 	serializer.WritePropertyWithDefault<bool>(206, "update_is_del_and_insert", update_is_del_and_insert);
+	if (serializer.ShouldSerialize(7)) {
+		serializer.WritePropertyWithDefault<string>(207, "serialized_table_identity", table.GetLogicalWriteTargetIdentity());
+	}
 }
 
 unique_ptr<LogicalOperator> LogicalUpdate::Deserialize(Deserializer &deserializer) {
 	auto table_info = deserializer.ReadPropertyWithDefault<unique_ptr<CreateInfo>>(200, "table_info");
-	auto result = duckdb::unique_ptr<LogicalUpdate>(new LogicalUpdate(deserializer.Get<ClientContext &>(), table_info));
-	deserializer.ReadPropertyWithDefault<idx_t>(201, "table_index", result->table_index);
-	deserializer.ReadPropertyWithDefault<bool>(202, "return_chunk", result->return_chunk);
-	deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(203, "expressions", result->expressions);
-	deserializer.ReadPropertyWithDefault<vector<PhysicalIndex>>(204, "columns", result->columns);
-	deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(205, "bound_defaults", result->bound_defaults);
-	deserializer.ReadPropertyWithDefault<bool>(206, "update_is_del_and_insert", result->update_is_del_and_insert);
+	auto table_index = deserializer.ReadPropertyWithDefault<idx_t>(201, "table_index");
+	auto return_chunk = deserializer.ReadPropertyWithDefault<bool>(202, "return_chunk");
+	auto expressions = deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(203, "expressions");
+	auto columns = deserializer.ReadPropertyWithDefault<vector<PhysicalIndex>>(204, "columns");
+	auto bound_defaults = deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(205, "bound_defaults");
+	auto update_is_del_and_insert = deserializer.ReadPropertyWithDefault<bool>(206, "update_is_del_and_insert");
+	auto serialized_table_identity = deserializer.ReadPropertyWithDefault<string>(207, "serialized_table_identity");
+	auto result = duckdb::unique_ptr<LogicalUpdate>(new LogicalUpdate(deserializer.Get<ClientContext &>(), table_info, std::move(serialized_table_identity)));
+	result->table_index = table_index;
+	result->return_chunk = return_chunk;
+	result->expressions = std::move(expressions);
+	result->columns = std::move(columns);
+	result->bound_defaults = std::move(bound_defaults);
+	result->update_is_del_and_insert = update_is_del_and_insert;
+	return std::move(result);
+}
+
+void LogicalVLLMProject::Serialize(Serializer &serializer) const {
+	LogicalOperator::Serialize(serializer);
+	serializer.WritePropertyWithDefault<idx_t>(200, "table_index", table_index);
+	serializer.WritePropertyWithDefault<unique_ptr<Expression>>(201, "vllm_expr", vllm_expr);
+	serializer.WritePropertyWithDefault<string>(202, "output_column_name", output_column_name);
+}
+
+unique_ptr<LogicalOperator> LogicalVLLMProject::Deserialize(Deserializer &deserializer) {
+	auto table_index = deserializer.ReadPropertyWithDefault<idx_t>(200, "table_index");
+	auto vllm_expr = deserializer.ReadPropertyWithDefault<unique_ptr<Expression>>(201, "vllm_expr");
+	auto output_column_name = deserializer.ReadPropertyWithDefault<string>(202, "output_column_name");
+	auto result = duckdb::unique_ptr<LogicalVLLMProject>(new LogicalVLLMProject(table_index, std::move(vllm_expr), std::move(output_column_name)));
 	return std::move(result);
 }
 

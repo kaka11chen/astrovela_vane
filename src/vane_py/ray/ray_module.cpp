@@ -23,6 +23,7 @@
 #include <duckdb/execution/distributed/copy_to_file.hpp>
 #include <duckdb/execution/distributed/copy_finalize.hpp>
 #include <duckdb/execution/distributed/extension_write_task_provider.hpp>
+#include <duckdb/execution/distributed/planning_state.hpp>
 #include <duckdb/execution/distributed/plan/exchange_sink_instance_task.hpp>
 #include <duckdb/execution/distributed/plan/exchange_source_task.hpp>
 #include <duckdb/execution/distributed/plan/fte_split_queue.hpp>

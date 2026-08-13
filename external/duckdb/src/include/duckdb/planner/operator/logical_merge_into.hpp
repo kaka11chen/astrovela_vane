@@ -69,7 +69,8 @@ protected:
 	void ResolveTypes() override;
 
 private:
-	LogicalMergeInto(ClientContext &context, const unique_ptr<CreateInfo> &table_info);
+	LogicalMergeInto(ClientContext &context, const unique_ptr<CreateInfo> &table_info,
+	                 string serialized_table_identity);
 };
 
 } // namespace duckdb

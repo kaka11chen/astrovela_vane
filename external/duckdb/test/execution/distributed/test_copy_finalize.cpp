@@ -949,6 +949,8 @@ TEST_CASE("Distributed COPY treats only not-found list failures as empty",
 
 	std::runtime_error python_missing("FileNotFoundError: /missing");
 	REQUIRE(DistributedCopyExceptionIsNotFound(python_missing));
+	IOException s3_missing({{"errno", "404"}}, "injected S3 missing object");
+	REQUIRE(DistributedCopyExceptionIsNotFound(s3_missing));
 
 	ErrnoListFileSystem partial_missing_fs(ENOENT, true);
 	auto partial_missing_res = ListDistributedCopyFilesUnderPrefix(partial_missing_fs, "/partial");
