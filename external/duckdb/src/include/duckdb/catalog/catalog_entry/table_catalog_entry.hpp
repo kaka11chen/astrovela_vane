@@ -64,6 +64,17 @@ public:
 public:
 	DUCKDB_API unique_ptr<CreateInfo> GetInfo() const override;
 
+	//! Return an opaque identity that remains stable for the lifetime of this
+	//! physical table. Serialized logical write plans use this to reject a
+	//! same-name replacement before it can receive an old write.
+	virtual string GetLogicalWriteTargetIdentity() const {
+		return string();
+	}
+	//! Verify that a deserialized logical write still resolves to its original
+	//! physical target. Catalogs that do not expose an identity return an empty
+	//! string and retain the standard name-based behavior.
+	DUCKDB_API void VerifyLogicalWriteTargetIdentity(const string &serialized_identity) const;
+
 	DUCKDB_API bool HasGeneratedColumns() const;
 
 	//! Returns whether or not a column with the given name exists

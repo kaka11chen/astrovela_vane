@@ -39,6 +39,6 @@ protected:
 	void ResolveTypes() override;
 
 private:
-	LogicalDelete(ClientContext &context, const unique_ptr<CreateInfo> &table_info);
+	LogicalDelete(ClientContext &context, const unique_ptr<CreateInfo> &table_info, string serialized_table_identity);
 };
 } // namespace duckdb

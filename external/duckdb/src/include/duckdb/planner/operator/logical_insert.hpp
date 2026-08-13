@@ -82,6 +82,6 @@ protected:
 	string GetName() const override;
 
 private:
-	LogicalInsert(ClientContext &context, const unique_ptr<CreateInfo> table_info);
+	LogicalInsert(ClientContext &context, const unique_ptr<CreateInfo> table_info, string serialized_table_identity);
 };
 } // namespace duckdb

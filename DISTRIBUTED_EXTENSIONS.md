@@ -219,15 +219,27 @@ cannot override that static contract.
 contract before translation, task selection, or artifact creation. There is no
 mode inference: the physical shape must exactly match the declared mode.
 
-Before any translation pass, Vane calls `PrepareDistributedWorkerPlan`. The
+Transported logical plans are rebuilt under a scoped distributed-planning
+state containing the stable operation ID. A catalog may override
+`CanPlanCreateTableAsReplay` only when an existing CTAS target durably records
+that exact ID. This narrow hook lets the catalog rebuild its normal extension
+write provider so reconciliation can run; unmatched or ordinary CTAS conflicts
+retain DuckDB's normal behavior.
+
+Before each translation pass, Vane calls `PrepareDistributedWorkerPlan`. The
 default implementation is a no-op. This hook may idempotently replace a
 coordinator-only child with a serializable worker input, but it must remain
-side-effect free because resource planning runs before the write transaction is
-opened. After protocol validation and after opening Vane's auto-commit
-transaction, `PlanRunner` calls `PrepareDistributedWrite`. An extension may use
-that second hook to resolve transaction-local catalog state. Any durable state
-created there must be addressable by the stable operation ID and removable by
-`AbortDistributedWrite` on a known pre-commit failure.
+side-effect free because translation may also be used for planning or
+inspection outside write execution. After protocol validation and after
+opening Vane's auto-commit transaction, `PlanRunner` first calls
+`ReconcileCommittedDistributedWrite`. A valid affected-row count is durable
+catalog proof that the stable operation already committed; Vane returns that
+result without preparation, translation, workers, finalization, or abort. The
+probe must be side-effect free and must not use process-local state as commit
+proof. If there is no proof, `PlanRunner` calls `PrepareDistributedWrite`. An
+extension may use that second hook to resolve transaction-local catalog state.
+Any durable state created there must be addressable by the stable operation ID
+and removable by `AbortDistributedWrite` on a known pre-commit failure.
 
 ### File-artifact mode
 
@@ -246,7 +258,9 @@ provider finalization, Vane persists a `catalog_commit_pending` lifecycle fence
 so age-based cleanup cannot delete files that a remote catalog may already
 reference. After the owned catalog transaction commits, Vane publishes the
 committed file marker. A retry with the same query identity returns that marker
-without invoking the provider again.
+without worker execution, provider validation, or provider finalization.
+Provider reconciliation and preparation may run first because preparation can
+be required to reconstruct the stable COPY namespace (for example, CTAS).
 
 ### Callback mode
 
@@ -282,10 +296,13 @@ keeping Vane independent of that schema.
 
 Callback mode has no engine-owned publication marker because Vane cannot
 interpret the extension's catalog state. A retry therefore presents the same
-stable operation ID to the provider. `ValidateDistributedWrite` must reconcile
-any durable state from an earlier attempt, and `FinalizeDistributedWrite` must
-be idempotent for that operation, including when an earlier catalog commit
-succeeded but its response was lost.
+stable operation ID to the provider.
+`ReconcileCommittedDistributedWrite` must inspect extension-owned durable
+catalog metadata before preparation or workers run. When the catalog cannot
+prove either commit or rollback, the provider must reject automatic replay and
+retain its operation fence and immutable artifacts. `ValidateDistributedWrite`
+still checks the current target invariants, and `FinalizeDistributedWrite` must
+remain idempotent for repeated calls in the same attempt.
 
 ### Coordinator finalization
 
@@ -293,17 +310,27 @@ Both modes use the same coordinator sequence:
 
 1. Validate the complete provider and worker protocol and establish the stable
    Vane operation/query ID.
-2. Call the side-effect-free `PrepareDistributedWorkerPlan` before resource
-   planning.
-3. Call `PrepareDistributedWrite` inside Vane's active transaction, then
-   translate the prepared worker subtree.
-4. Execute worker sinks and select successful task attempts.
-5. Validate and aggregate their opaque result envelopes.
-6. Call `FinalizeDistributedWrite` with exactly the selected envelopes inside
+2. Call the side-effect-free `ReconcileCommittedDistributedWrite` inside
+   Vane's active transaction. Return immediately when it proves a prior commit.
+3. Arm abort cleanup and call `PrepareDistributedWrite`.
+4. During translation, call the side-effect-free
+   `PrepareDistributedWorkerPlan` and translate the prepared worker subtree.
+5. Execute worker sinks and select successful task attempts.
+6. Validate and aggregate their opaque result envelopes.
+7. Call `FinalizeDistributedWrite` with exactly the selected envelopes inside
    Vane's active coordinator transaction.
-7. Require the provider's affected-row count to match the envelope total.
-8. Commit through DuckDB's transaction manager.
-9. For `FILE_ARTIFACT`, publish the committed file marker after catalog commit.
+8. Require the provider's affected-row count to match the envelope total.
+9. Commit through DuckDB's transaction manager.
+10. For `FILE_ARTIFACT`, publish the committed file marker after catalog
+    commit.
+11. After definitive catalog-commit success (including a reconciled replay),
+    call `ConfirmDistributedWriteCommit`. This post-commit hook may release
+    operation fences or other auxiliary state, but it must retain every durable
+    artifact referenced by the committed catalog state. Vane invokes the hook
+    in a fresh DuckDB transaction so context-scoped filesystems and secrets are
+    available without reusing or reopening the committed catalog transaction.
+    A hook failure is reported as a post-commit cleanup warning and cannot turn
+    the known commit into a failed write.
 
 `AbortDistributedWrite` is mandatory. Vane supplies the stable operation ID
 and invokes it once for known pre-commit failures, including cases where no
@@ -311,13 +338,26 @@ result envelope was returned, so the provider must be able to locate
 operation-owned artifacts from coordinator state and deterministic identities.
 A catalog commit exception is an unknown
 outcome: Vane retains all opaque or file artifacts and does not call abort.
+When reconciliation or a committed file marker proves that an earlier attempt
+already committed, Vane returns that historical result but rolls back the
+current replay transaction. This prevents transaction-local work performed by
+preparation, such as reconstructing a CTAS target, from becoming a second
+catalog side effect.
 
 Extension writes require DuckDB auto-commit mode. Vane owns that transaction
 boundary; an explicit caller-managed transaction is rejected before workers
 start because Vane could not safely publish a marker before the caller's later
-commit. File-artifact retries inspect the stable namespace before validation or
-worker scheduling. A valid committed marker returns the persisted result
-without invoking the provider again.
+commit. Extension-owned reconciliation runs before preparation, validation, or
+worker scheduling. File-artifact retries without extension proof also inspect
+the stable engine namespace; a valid committed marker returns the persisted
+result without invoking provider validation or finalization.
+
+Python relation `insert_into`, `update`, `delete`, and `create` (CTAS) expose
+only two explicit execution modes. `VANE_RUNNER=ray` always uses the
+distributed write path and propagates unsupported plans, bind failures, and
+execution failures without local fallback. `VANE_RUNNER=local-fast` executes
+directly in DuckDB as a separate backend. An unset or empty `VANE_RUNNER`, and
+the legacy `VANE_RUNNER=local` mode, are rejected for these mutation APIs.
 
 A worker, validation, provider, or other failure known to precede catalog
 commit rolls back the transaction and invokes explicit cleanup. If the catalog
@@ -357,17 +397,24 @@ For every distributed write provider:
   `DistributedWriteOperatorExtension`; do not duplicate them in the physical
   provider;
 - validate all catalog and output preconditions before workers start;
+- implement a side-effect-free `ReconcileCommittedDistributedWrite` probe when
+  the extension can durably prove a prior catalog commit, and never use an
+  in-memory cache as that proof;
 - use the supplied stable operation ID as the root of the complete speculative
   artifact namespace, including when no worker envelope is returned;
 - accept only the selected task-result envelopes during finalization;
 - reconcile the operation-owned task-attempt namespace against those selected
   envelopes and remove artifacts from unselected or retried attempts before
   registering catalog state;
-- make validation and finalization idempotent for a repeated operation ID and
-  reconcile an earlier ambiguous callback-mode commit before new workers run;
+- make validation and finalization idempotent for a repeated operation ID, and
+  either durably reconcile an earlier ambiguous callback-mode commit before new
+  workers run or reject the replay while retaining its fence and artifacts;
 - register their files or opaque fragments in the active coordinator
   transaction without committing it;
 - return the exact affected row count;
+- make `ConfirmDistributedWriteCommit` idempotently remove only auxiliary
+  commit fences after definitive commit success, while retaining committed
+  data, delete, and metadata artifacts;
 - implement `AbortDistributedWrite` for known pre-commit failure, including an
   empty selected-result set;
 - retain immutable artifacts when a remote catalog commit response is

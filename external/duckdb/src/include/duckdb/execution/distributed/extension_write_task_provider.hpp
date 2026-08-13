@@ -60,19 +60,44 @@ public:
 	virtual void PrepareDistributedWrite(ClientContext &context, const DistributedWriteOperationContext &operation) {
 	}
 
-	//! Validate coordinator/catalog state before any worker callback can run.
-	//! The stable operation identity may name an earlier attempt, so callback
-	//! providers must reconcile any durable operation state here without
-	//! committing the caller-owned transaction.
+	//! Reconcile a repeated stable operation before coordinator preparation or
+	//! worker execution. A valid row count is a durable proof that the catalog
+	//! commit already completed; Vane returns it as a committed replay without
+	//! invoking any preparation, validation, worker, finalization, or abort hook.
+	//! The default means that no committed operation was found. Implementations
+	//! must keep this probe side-effect free and must not use process-local state
+	//! as proof of a catalog commit.
+	virtual optional_idx ReconcileCommittedDistributedWrite(ClientContext &context,
+	                                                        const DistributedWriteOperationContext &operation) const {
+		return optional_idx();
+	}
+
+	//! Validate current coordinator/catalog state before any worker callback can
+	//! run. Durable replay detection belongs in
+	//! ReconcileCommittedDistributedWrite; this hook must not commit the
+	//! caller-owned transaction.
 	virtual void ValidateDistributedWrite(ClientContext &context,
 	                                      const DistributedWriteOperationContext &operation) const = 0;
 
 	//! Register exactly the selected task results in the active coordinator
-	//! catalog transaction. Repeating the same operation must be idempotent,
-	//! including after an earlier commit response was lost. Returns the number
-	//! of affected rows represented by the selected results.
+	//! catalog transaction. Repeating finalization in the same attempt must be
+	//! idempotent; a later attempt with a lost commit response is handled by
+	//! durable reconciliation before this hook is reached. Returns the number of
+	//! affected rows represented by the selected results.
 	virtual idx_t FinalizeDistributedWrite(ClientContext &context, const DistributedWriteOperationContext &operation,
 	                                       const vector<DistributedWriteTaskResult> &results) const = 0;
+
+	//! Release commit fences or other auxiliary state only after the owner of the
+	//! coordinator transaction has received definitive commit success. Durable
+	//! data artifacts referenced by the committed catalog state must be retained.
+	//! This hook is also invoked for a reconciled committed replay, allowing a
+	//! prior attempt whose commit response was lost to finish its safe cleanup.
+	//! The context owns a fresh active transaction for filesystem, secret, and
+	//! catalog services; it is never the transaction that committed the write.
+	virtual void ConfirmDistributedWriteCommit(ClientContext &context,
+	                                           const DistributedWriteOperationContext &operation,
+	                                           const vector<DistributedWriteTaskResult> &selected_results) {
+	}
 
 	//! Remove every worker artifact belonging to this operation after a known
 	//! pre-commit failure. The provider must be able to clean the operation from

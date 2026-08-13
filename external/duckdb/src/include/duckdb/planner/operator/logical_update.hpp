@@ -50,6 +50,6 @@ protected:
 	void ResolveTypes() override;
 
 private:
-	LogicalUpdate(ClientContext &context, const unique_ptr<CreateInfo> &table_info);
+	LogicalUpdate(ClientContext &context, const unique_ptr<CreateInfo> &table_info, string serialized_table_identity);
 };
 } // namespace duckdb
