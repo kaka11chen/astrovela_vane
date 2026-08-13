@@ -582,9 +582,9 @@ public:
 			return DuckDBResult<PlanResult>::err(primary_error);
 		};
 		auto fail_with_retained_extension_state = [&](const DuckDBError &error) -> DuckDBResult<PlanResult> {
-			// An existing direct-write fence or an unreadable stable namespace can
-			// represent a catalog commit whose response was lost. Never invoke the
-			// provider's destructive abort hook for an indeterminate outcome.
+			// An existing direct-write lifecycle can represent a file publication
+			// whose response was lost. Never invoke the provider's destructive abort
+			// hook for an indeterminate outcome.
 			extension_abort_guard.Dismiss();
 			return DuckDBResult<PlanResult>::err(error);
 		};
@@ -610,27 +610,6 @@ public:
 			if (!client_context_->transaction.HasActiveTransaction()) {
 				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
 				    "distributed extension write requires an active Vane-owned auto-commit transaction"));
-			}
-			try {
-				auto committed_rows = extension_write_provider->ReconcileCommittedDistributedWrite(
-				    *client_context_, extension_write_operation);
-				if (committed_rows.IsValid()) {
-					DistributedExtensionWriteResult result;
-					result.info = *extension_write_info;
-					result.rows_written = committed_rows.GetIndex();
-					result.catalog_committed = true;
-					if (extension_write_info->mode == DistributedWriteMode::FILE_ARTIFACT) {
-						result.file_result.rows_copied = committed_rows.GetIndex();
-						result.file_result.output_committed = true;
-					}
-					return DuckDBResult<PlanResult>::ok(PlanResult::make_extension_write(std::move(result)));
-				}
-			} catch (const std::exception &ex) {
-				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
-				    StringUtil::Format("distributed extension write reconciliation failed: %s", ex.what())));
-			} catch (...) {
-				return DuckDBResult<PlanResult>::err(DuckDBError::external_error(
-				    "distributed extension write reconciliation threw an unknown exception"));
 			}
 			extension_abort_guard.Arm();
 			try {

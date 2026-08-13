@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 import vane
 from vane import _native
-from vane._ray_cxx import require_ray_cxx_attr
+from vane._ray_cxx import new_distributed_operation_id, require_ray_cxx_attr
 
 
 def test_require_ray_cxx_attr_returns_registered_binding():
@@ -23,3 +25,9 @@ def test_require_ray_cxx_attr_missing_binding_raises_clear_importerror(monkeypat
 
     with pytest.raises(ImportError, match=r"vane\.ray_cxx\.MissingBinding"):
         require_ray_cxx_attr("MissingBinding")
+
+
+def test_distributed_operation_ids_are_uuidv7():
+    operation_id = new_distributed_operation_id()
+
+    assert uuid.UUID(operation_id).version == 7

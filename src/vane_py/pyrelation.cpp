@@ -1058,7 +1058,12 @@ struct SafeRelationPyObject {
 	}
 };
 
-static std::unordered_map<DatabaseInstance *, SafeRelationPyObject> per_db_runners;
+struct CachedRunnerForDatabase {
+	string runner_type;
+	SafeRelationPyObject runner;
+};
+
+static std::unordered_map<DatabaseInstance *, CachedRunnerForDatabase> per_db_runners;
 
 static DatabaseInstance *GetRelationDatabasePtr(const shared_ptr<Relation> &rel) {
 	if (!rel || !rel->context) {
@@ -1113,8 +1118,8 @@ static RunnerForDatabase GetOrCreateRunnerForDB(const shared_ptr<Relation> &rel,
 	{
 		std::lock_guard<std::mutex> guard(per_db_runner_mutex);
 		auto it = per_db_runners.find(db_ptr);
-		if (it != per_db_runners.end()) {
-			auto runner = it->second.Get();
+		if (it != per_db_runners.end() && it->second.runner_type == runner_type) {
+			auto runner = it->second.runner.Get();
 			if (!runner.is_none()) {
 				return {db_ptr, std::move(runner)};
 			}
@@ -1138,7 +1143,7 @@ static RunnerForDatabase GetOrCreateRunnerForDB(const shared_ptr<Relation> &rel,
 
 	{
 		std::lock_guard<std::mutex> guard(per_db_runner_mutex);
-		per_db_runners[db_ptr] = SafeRelationPyObject(runner);
+		per_db_runners[db_ptr] = CachedRunnerForDatabase {runner_type, SafeRelationPyObject(runner)};
 	}
 	return {db_ptr, std::move(runner)};
 }
@@ -1171,7 +1176,7 @@ static unique_ptr<QueryResult> PyExecuteRelation(const shared_ptr<Relation> &rel
 	return DuckDBPyConnection::CompletePendingQuery(*pending_query);
 }
 
-// INSERT INTO, UPDATE, DELETE, and CTAS deliberately expose only two execution
+// INSERT, INSERT INTO, UPDATE, DELETE, and CTAS deliberately expose only two execution
 // contracts. Callers must select one explicitly: Ray is always distributed and
 // local-fast executes directly in DuckDB. There is no implicit runner selection
 // and no local fallback after distributed planning or execution starts.
@@ -2139,10 +2144,13 @@ void DuckDBPyRelation::Insert(const py::object &params) const {
 		throw InvalidInputException("'DuckDBPyRelation.insert' can only be used on a table relation");
 	}
 	vector<vector<Value>> values {DuckDBPyConnection::TransformPythonParamList(params)};
-
-	D_ASSERT(py::gil_check());
-	py::gil_scoped_release release;
-	rel->Insert(values);
+	vector<string> column_names;
+	auto values_relation =
+	    make_shared_ptr<ValueRelation>(rel->context->GetContext(), values, std::move(column_names), "values");
+	auto &table = static_cast<TableRelation &>(*rel);
+	auto insert =
+	    values_relation->InsertRel(table.description->database, table.description->schema, table.description->table);
+	ExecuteRelationWrite(insert, connection_owner, "INSERT");
 }
 
 void DuckDBPyRelation::Create(const string &table) {

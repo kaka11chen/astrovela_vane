@@ -5,7 +5,6 @@
 #include "duckdb/execution/operator/persistent/physical_batch_insert.hpp"
 #include "duckdb/execution/operator/persistent/physical_insert.hpp"
 #include "duckdb/execution/operator/schema/physical_create_table.hpp"
-#include "duckdb/execution/distributed/planning_state.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -41,13 +40,7 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalCreateTable &op) {
 	auto existing_entry = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, create_info.schema, create_info.table,
 	                                       OnEntryNotFound::RETURN_NULL);
 	bool replace = op.info->Base().on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;
-	bool distributed_replay = false;
-	auto distributed_planning = distributed::DistributedPlanningState::Get(context);
-	if (existing_entry && !replace && distributed_planning && !op.children.empty()) {
-		distributed_replay =
-		    catalog.CanPlanCreateTableAsReplay(context, op, *existing_entry, distributed_planning->operation_id);
-	}
-	if ((!existing_entry || replace || distributed_replay) && !op.children.empty()) {
+	if ((!existing_entry || replace) && !op.children.empty()) {
 		auto &plan = CreatePlan(*op.children[0]);
 		return op.schema.catalog.PlanCreateTableAs(context, *this, op, plan);
 	}
