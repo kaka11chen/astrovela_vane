@@ -11,10 +11,12 @@ LogicalUpdate::LogicalUpdate(TableCatalogEntry &table)
     : LogicalOperator(LogicalOperatorType::LOGICAL_UPDATE), table(table), table_index(0), return_chunk(false) {
 }
 
-LogicalUpdate::LogicalUpdate(ClientContext &context, const unique_ptr<CreateInfo> &table_info)
+LogicalUpdate::LogicalUpdate(ClientContext &context, const unique_ptr<CreateInfo> &table_info,
+                             string serialized_table_identity)
     : LogicalOperator(LogicalOperatorType::LOGICAL_UPDATE),
       table(Catalog::GetEntry<TableCatalogEntry>(context, table_info->catalog, table_info->schema,
                                                  table_info->Cast<CreateTableInfo>().table)) {
+	table.VerifyLogicalWriteTargetIdentity(serialized_table_identity);
 	auto binder = Binder::CreateBinder(context);
 	bound_constraints = binder->BindConstraints(table);
 }

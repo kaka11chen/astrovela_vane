@@ -98,6 +98,16 @@ PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(
 		    "pre-resolved distributed extension write protocol requires an extension write root"));
 	}
 	try {
+		auto provider = plan->Root().GetExtensionWriteTaskProvider();
+		if (provider) {
+			if (!client_context) {
+				throw InvalidInputException("Distributed extension write requires a ClientContext");
+			}
+			DistributedWriteOperationContext operation;
+			operation.operation_id = translator.plan_config_.query_id;
+			operation.Validate();
+			provider->PrepareDistributedWorkerPlan(*client_context, operation);
+		}
 		translator.VisitOperator(plan->Root());
 	} catch (const NotImplementedException &ex) {
 		ErrorData error(ex);

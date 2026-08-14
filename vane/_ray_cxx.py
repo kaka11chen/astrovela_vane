@@ -142,6 +142,17 @@ def require_ray_cxx_attr(name: str, *, hint: str | None = None) -> object:
         ) from ex
 
 
+def new_distributed_operation_id() -> str:
+    """Return the native UUIDv7 used for distributed write identity."""
+    factory = require_ray_cxx_attr("_new_distributed_operation_id")
+    if not callable(factory):
+        raise TypeError("vane.ray_cxx._new_distributed_operation_id must be callable")
+    operation_id = str(factory())
+    if not operation_id:
+        raise RuntimeError("native distributed operation ID generator returned an empty value")
+    return operation_id
+
+
 def validate_plan_serialization_for_submission(plan: Any) -> None:
     """Validate a native physical root before Driver resource registration."""
     validator = getattr(plan, "_validate_serializable_for_submission", None)

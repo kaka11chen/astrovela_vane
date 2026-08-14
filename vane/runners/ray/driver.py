@@ -1276,6 +1276,8 @@ def _udf_test_hooks_enabled() -> bool:
 
 @ray.remote(
     num_cpus=0,
+    max_restarts=0,
+    max_task_retries=0,
 )
 class RayQueryDriverActor:
     def __init__(

@@ -321,6 +321,9 @@ void register_ray_bindings(py::module_ &mod) {
 	auto m = mod.def_submodule("ray_cxx");
 	m.doc() = "C++ Ray execution bindings (experimental)";
 	m.def(
+	    "_new_distributed_operation_id", []() { return UUIDv7::ToString(UUIDv7::GenerateRandomUUID()); },
+	    "Return a UUIDv7 suitable for a distributed operation and catalog idempotency key.");
+	m.def(
 	    "_install_counting_result_collector_for_test",
 	    [](py::object conn_obj) {
 		    auto &conn_wrapper = ExtractPyConnectionWrapper(std::move(conn_obj));
