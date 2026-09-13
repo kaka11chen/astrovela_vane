@@ -245,14 +245,14 @@ def test_rebuilt_soxr_changes_native_behavior_without_resigning_extension(tmp_pa
                 try:
                     _prepare_dynamic_extension_snapshot(worker, _capture_dynamic_extension_snapshot(connection))
                 except ValueError as error:
-                    assert 'official runtime' in str(error)
+                    assert 'allow_distributed=True' in str(error)
                 else:
                     raise AssertionError('worker preparation accepted a custom runtime')
                 vane.load_installed_extension('native_media', connection=worker)
                 try:
                     vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(worker.sql('SELECT 1'), None)
                 except (ValueError, vane.InvalidInputException) as error:
-                    assert 'official runtime' in str(error)
+                    assert 'allow_distributed=True' in str(error)
                 else:
                     raise AssertionError('Ray plan capture accepted a custom runtime')
         after = hashlib.sha256(artifact.path.read_bytes()).hexdigest()
