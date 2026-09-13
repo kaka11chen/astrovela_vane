@@ -47,6 +47,21 @@ struct PyPhysicalPlanWrapper {
 	py::object connection_snapshot_; // Connection settings/extensions snapshot captured from the source relation
 	string serialized_root_;         // Deferred serialized PhysicalOperator bytes (for pickle round-trips)
 
+	PyPhysicalPlanWrapper(const PyPhysicalPlanWrapper &) = default;
+	PyPhysicalPlanWrapper(PyPhysicalPlanWrapper &&) = default;
+	PyPhysicalPlanWrapper &operator=(const PyPhysicalPlanWrapper &) = default;
+	PyPhysicalPlanWrapper &operator=(PyPhysicalPlanWrapper &&) = default;
+
+	~PyPhysicalPlanWrapper() {
+		// A caller can close worker_connection_ while this context still owns
+		// the database. Its scheduler joins native threads, whose Python thread
+		// state cleanup needs the GIL. Destroy the plan before its allocator and
+		// release both without the GIL, keeping Python members alive until then.
+		py::gil_scoped_release release;
+		plan_.reset();
+		client_context_.reset();
+	}
+
 	bool has_root() const {
 		return plan_ && plan_->physical_plan() && plan_->physical_plan()->HasRoot();
 	}

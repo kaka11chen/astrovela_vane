@@ -428,7 +428,8 @@ with vane.connect(config={'allow_unsigned_extensions': 'true', 'threads': 1}) as
 
 
 @pytest.mark.parametrize("caller", ["main", "python-thread"])
-def test_python_image_callbacks_release_exited_native_thread_states(caller, tmp_path):
+@pytest.mark.parametrize("execution", ["connection", "physical-plan"])
+def test_python_image_callbacks_release_exited_native_thread_states(caller, execution, tmp_path):
     program = r"""
 import ctypes
 import faulthandler
@@ -455,11 +456,25 @@ def execute():
         for _ in range(3):
             with vane.connect(config={'threads': 8, 'image_backend': 'python'}) as con:
                 con.execute('CREATE TABLE inputs AS SELECT i FROM range(1000000) t(i)')
-                assert con.execute(
+                query = (
                     "SELECT sum(image_width(crop("
                     "image(repeat(chr((65+i%20)::INTEGER),4)::BLOB,1,1,4,'RGBA'),[0,0,1,1]))) "
                     "FROM inputs WHERE i%1000=0"
-                ).fetchone() == (1000,)
+                )
+                if sys.argv[3] == 'physical-plan':
+                    relation = con.sql(query)
+                    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
+                    physical = logical.to_physical_plan(con)
+                    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+                    result = runner.execute_native(con.cursor(), physical, None, None)
+                    assert sum(table.column(0)[0].as_py() for table in result.partition_payloads) == 1000
+                    del result, runner, logical, relation
+                else:
+                    assert con.execute(query).fetchone() == (1000,)
+            if sys.argv[3] == 'physical-plan':
+                # The closed parent no longer owns the database. Dropping the
+                # last plan must let native threads acquire the GIL and exit.
+                del physical
     except BaseException as error:
         errors.append(error)
 
@@ -490,7 +505,7 @@ for thread_id in native_threads:
     tunables = env.get("GLIBC_TUNABLES", "")
     env["GLIBC_TUNABLES"] = ":".join(filter(None, (tunables, "glibc.pthread.stack_cache_size=0")))
     completed = subprocess.run(
-        [sys.executable, "-I", "-c", program, caller, str(tmp_path / "threads.txt")],
+        [sys.executable, "-I", "-c", program, caller, str(tmp_path / "threads.txt"), execution],
         env=env,
         capture_output=True,
         text=True,
