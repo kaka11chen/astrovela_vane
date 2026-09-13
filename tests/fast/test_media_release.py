@@ -21,6 +21,7 @@ from tests.fast.test_native_runtime_extension_wheels import release_runtime as r
 from tests.fast.test_native_runtime_extension_wheels import runtime_wheel as runtime_wheel
 from tests.fast.test_native_runtime_extension_wheels import source_sdk as source_sdk
 from vane_packaging import media_release as delivery
+from vane_packaging.artifact_limits import MAX_PUBLICATION_FILE_BYTES, MEBIBYTE
 from vane_packaging.python_delivery import inventory_delivery
 
 
@@ -60,6 +61,60 @@ def test_complete_delivery_is_verified_before_exposure_and_can_be_rechecked(rele
     ).read_bytes()
     with pytest.raises(ValueError, match="new directory"):
         delivery.prepare_release(**inputs, output=output)
+
+
+@pytest.mark.parametrize("role", ["base", "provider"])
+@pytest.mark.parametrize("size", [110 * MEBIBYTE, MAX_PUBLICATION_FILE_BYTES])
+def test_delivery_stages_wheels_within_the_full_publication_budget(release_inputs, tmp_path, monkeypatch, role, size):
+    inputs, _ = release_inputs
+    # Isolate delivery byte limits from archive/native validation. Sparse input
+    # padding exercises the real bounded copying and manifest verification.
+    with inputs[role].open("r+b") as wheel:
+        wheel.truncate(size)
+    verified_sizes = []
+
+    def verify_artifacts(directory, manifest, trust_identity):
+        verified_sizes.append((directory / manifest["artifacts"][role]["filename"]).stat().st_size)
+
+    monkeypatch.setattr(delivery, "_verify_contents", verify_artifacts)
+    output = tmp_path / "delivery"
+    digest = delivery.prepare_release(**inputs, output=output)
+    manifest = delivery.verify_release(output, trust_identity=TRUST_IDENTITY, manifest_sha256=digest)
+    assert manifest["artifacts"][role]["size"] == size
+    assert verified_sizes == [size, size]
+
+
+@pytest.mark.parametrize(
+    ("role", "limit"),
+    [
+        ("base", MAX_PUBLICATION_FILE_BYTES),
+        ("provider", MAX_PUBLICATION_FILE_BYTES),
+        ("runtime", 100 * MEBIBYTE),
+        ("source", 100 * MEBIBYTE),
+    ],
+)
+def test_delivery_preserves_each_artifacts_publication_boundary(release_inputs, tmp_path, role, limit):
+    inputs, calls = release_inputs
+    output = tmp_path / "delivery"
+    delivery.prepare_release(**inputs, output=output)
+    path = output / delivery.MANIFEST
+    manifest = json.loads(path.read_bytes())
+    record = manifest["artifacts"][role]
+    record["size"] = limit
+    path.write_bytes(delivery.runtime_format().canonical_json(manifest))
+    delivery.read_manifest(path, trust_identity=TRUST_IDENTITY)
+    record["size"] += 1
+    path.write_bytes(delivery.runtime_format().canonical_json(manifest))
+    with pytest.raises(ValueError, match="invalid artifact size"):
+        delivery.read_manifest(path, trust_identity=TRUST_IDENTITY)
+
+    with inputs[role].open("r+b") as artifact:
+        artifact.truncate(limit + 1)
+    rejected = tmp_path / "oversized-delivery"
+    with pytest.raises(ValueError, match="exceeds"):
+        delivery.prepare_release(**inputs, output=rejected)
+    assert not rejected.exists()
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("damage", ["missing", "bytes", "symlink", "extra", "wrong-manifest", "wrong-trust"])

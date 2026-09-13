@@ -16,14 +16,15 @@ from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from vane_packaging.archive_safety import snapshot_archive
+from vane_packaging.artifact_limits import MAX_PUBLICATION_FILE_BYTES
 from vane_packaging.media_runtime import read_runtime_wheel, verify_runtime_source
 from vane_packaging.media_version import runtime_format
 
 MANIFEST = "media-release.json"
 INSTRUCTIONS = "NATIVE_MEDIA_REPLACEMENT.md"
 _LIMITS = {
-    "base": 100 * 1024 * 1024,
-    "provider": 100 * 1024 * 1024,
+    "base": MAX_PUBLICATION_FILE_BYTES,
+    "provider": MAX_PUBLICATION_FILE_BYTES,
     "runtime": 100 * 1024 * 1024,
     "source": 100 * 1024 * 1024,
     "instructions": 1024 * 1024,
