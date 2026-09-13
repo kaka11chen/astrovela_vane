@@ -408,6 +408,37 @@ def test_sdk_build_rejects_a_previous_installation(source_sdk):
         backend._build_sdk(project)
 
 
+@pytest.mark.parametrize("fail_first", [False, True])
+def test_runtime_rebuilds_keep_native_outputs_in_the_disposable_snapshot(source_sdk, monkeypatch, fail_first):
+    project, files, archive, backend = source_sdk
+    _archive(archive, files)
+    snapshots = []
+
+    def build_native_fixture(_output, _settings, _source, _contents, _identity, snapshot):
+        snapshots.append(snapshot)
+        prefix = backend._build_sdk(snapshot)
+        prefix.mkdir(parents=True)
+        (prefix / "built-library.so").write_bytes(b"native build fixture")
+        if fail_first and len(snapshots) == 1:
+            raise RuntimeError("packaging failed after the SDK build")
+        return "rebuilt.whl"
+
+    monkeypatch.setattr(backend.subprocess, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(backend, "_build_wheel", build_native_fixture)
+    settings = {"source-archive": str(archive)}
+    if fail_first:
+        with pytest.raises(RuntimeError, match="packaging failed"):
+            backend.build_wheel(str(project / "dist"), settings)
+    else:
+        assert backend.build_wheel(str(project / "dist"), settings) == "rebuilt.whl"
+    assert backend.build_wheel(str(project / "dist"), settings) == "rebuilt.whl"
+    assert len(snapshots) == 2
+    assert snapshots[0] != snapshots[1]
+    assert all(not snapshot.exists() for snapshot in snapshots)
+    assert not (project / "build").exists()
+    assert {p.relative_to(project).as_posix() for p in project.rglob("*") if p.is_file()} == files.keys()
+
+
 def test_runtime_source_verification_checks_structure_after_the_signed_digest(source_sdk):
     _, files, archive, _ = source_sdk
     contents = _archive(archive, files)

@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tarfile
@@ -68,7 +67,32 @@ def build(vcpkg: Path, directory: Path, platform: str) -> None:
         "test-only": "true",
         "signing-key": str(ROOT / "external/duckdb/test/mbedtls/private.pem"),
     }
-    program = "import sys,json;sys.path.insert(0,sys.argv[1]);import backend;print(backend.build_wheel(sys.argv[2],json.loads(sys.argv[3])))"
+    retained_sdk = directory / "sdk"
+    local_source = directory / "local-soxr-source"
+    # The backend removes its verified build tree after packaging. This fixture
+    # explicitly retains the SDK and SoXR sources needed by subsequent checks.
+    program = """
+import json
+import shutil
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import backend
+
+build_sdk = backend._build_sdk
+
+def retain_fixture_sdk(project):
+    prefix = build_sdk(project)
+    shutil.copytree(prefix, sys.argv[4], symlinks=True)
+    sources = list((project / 'build/buildtrees/soxr/src').glob('*.clean'))
+    if len(sources) != 1:
+        raise ValueError('expected one rebuilt SoXR source tree')
+    shutil.copytree(sources[0], sys.argv[5], symlinks=True)
+    return prefix
+
+backend._build_sdk = retain_fixture_sdk
+print(backend.build_wheel(sys.argv[2], json.loads(sys.argv[3])))
+"""
     subprocess.run(
         [
             sys.executable,
@@ -78,6 +102,8 @@ def build(vcpkg: Path, directory: Path, platform: str) -> None:
             str(source_project),
             str(directory / "dist"),
             json.dumps(settings),
+            str(retained_sdk),
+            str(local_source),
         ],
         cwd=source_project,
         env=environment,
@@ -93,9 +119,6 @@ def build(vcpkg: Path, directory: Path, platform: str) -> None:
             destination = directory / "runtime" / name.removeprefix("vane_media_runtime/")
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(stream.read(name))
-    soxr_source = next((source_project / "build/buildtrees/soxr/src").glob("*.clean"))
-    local_source = directory / "local-soxr-source"
-    shutil.copytree(soxr_source, local_source)
     implementation = local_source / "src/soxr.c"
     contents = implementation.read_text()
     original = 'return "libsoxr-" SOXR_THIS_VERSION_STR;'
@@ -139,7 +162,7 @@ def build(vcpkg: Path, directory: Path, platform: str) -> None:
     paths = {
         "runtime_wheel": str(wheel),
         "source_archive": str(archive),
-        "sdk": str(source_project / "build/installed/x64-linux-vane-media"),
+        "sdk": str(retained_sdk),
         "runtime": str(directory / "runtime"),
         "local_runtime": str(directory / "local-runtime"),
     }

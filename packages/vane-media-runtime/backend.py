@@ -56,7 +56,7 @@ def _build_sdk(project):
     if not (project / "source-inventory.json").is_file():
         raise ValueError("build runtime wheels from the exported source distribution")
     sdk = project / "sdk"
-    build = PROJECT / "build"
+    build = project / "build"
     if build.exists():
         raise ValueError("runtime source rebuild requires a fresh SDK extraction without a build directory")
     build.mkdir()
