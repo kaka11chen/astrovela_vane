@@ -119,7 +119,12 @@ def prepare_snapshot(artifact: Path, descriptor: DynamicExtensionDescriptor, cac
     """Atomically publish the extension and its complete effective runtime together."""
     global _selected
     from vane import _native
-    from vane.extensions import DynamicExtensionResolver, _copy_and_hash_artifact, _sha256_file
+    from vane.extensions import (
+        DynamicExtensionResolver,
+        _copy_and_hash_artifact,
+        _make_snapshot_read_only,
+        _sha256_file,
+    )
 
     if descriptor.native_runtime is None:
         raise ValueError("native media snapshot requires a runtime reference")
@@ -143,16 +148,22 @@ def prepare_snapshot(artifact: Path, descriptor: DynamicExtensionDescriptor, cac
             return target
         staging = Path(tempfile.mkdtemp(prefix=".media-", dir=parent))
         try:
-            actual_digest = _copy_and_hash_artifact(artifact, staging / artifact.name)
+            DynamicExtensionResolver._prepare_created_private_directory(staging, description="native media staging")
+            staged_artifact = staging / artifact.name
+            actual_digest = _copy_and_hash_artifact(artifact, staged_artifact)
             if actual_digest != descriptor.sha256:
                 raise ValueError("native media extension digest differs from its descriptor")
-            if fmt.trailer_digest((staging / artifact.name).read_bytes()) != descriptor.native_runtime.manifest_sha256:
+            _make_snapshot_read_only(staged_artifact, description="native media extension")
+            if fmt.trailer_digest(staged_artifact.read_bytes()) != descriptor.native_runtime.manifest_sha256:
                 raise ValueError("native media extension trailer differs from its descriptor")
             (staging / fmt.MANIFEST).write_bytes(official)
             (staging / fmt.SIGNATURE).write_bytes(signature)
             (staging / "effective-runtime.json").write_bytes(effective)
             library_directory = staging / ".libs"
             library_directory.mkdir(mode=0o700)
+            DynamicExtensionResolver._prepare_created_private_directory(
+                library_directory, description="native media libraries"
+            )
             for name, record in manifest["files"].items():
                 contents = fmt.read_file(source / ".libs", name)
                 if len(contents) != record["size"] or hashlib.sha256(contents).hexdigest() != record["sha256"]:

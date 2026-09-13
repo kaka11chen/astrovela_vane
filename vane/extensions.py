@@ -1362,12 +1362,15 @@ def load_installed_extension(
     return resolver.load(connection, root_descriptor)
 
 
-def _prepare_dynamic_extension_snapshot(connection: DuckDBPyConnection, snapshot: object) -> None:
-    """Resolve, verify, and load a worker manifest from preinstalled providers."""
+def _prepare_dynamic_extension_snapshot(
+    connection: DuckDBPyConnection, snapshot: object, *, in_process: bool = False
+) -> None:
+    """Replay a manifest from installed providers, requiring official runtimes for workers."""
     expected_descriptors = _parse_dynamic_extension_snapshot(snapshot)
     from vane._native_runtime import require_official_distributed_runtime
 
-    require_official_distributed_runtime(expected_descriptors)
+    if not in_process:
+        require_official_distributed_runtime(expected_descriptors)
     existing_descriptors = _parse_dynamic_extension_snapshot(_capture_dynamic_extension_snapshot(connection))
     if existing_descriptors:
         if existing_descriptors != expected_descriptors:

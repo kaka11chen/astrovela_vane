@@ -6,10 +6,12 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import shutil
+import stat
 import struct
 import subprocess
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
@@ -197,6 +199,48 @@ def test_native_runtime_reuses_valid_snapshot_without_staging(snapshot_inputs, m
     assert runtime.prepare_snapshot(artifact, descriptor, cache) == target
     assert runtime.prepare_snapshot(artifact, descriptor, cache) == target
     assert runtime._selected == descriptor.native_runtime.manifest_sha256
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows permissions do not use umask")
+@pytest.mark.parametrize("invalid_trailer", [False, True])
+def test_native_runtime_staging_handles_restrictive_umask(snapshot_inputs, invalid_trailer):
+    runtime, artifact, descriptor, cache, _ = snapshot_inputs
+    if invalid_trailer:
+        contents = fmt.attach_trailer(b"extension payload" + bytes(512), "f" * 64)
+        artifact.write_bytes(contents)
+        descriptor = replace(descriptor, sha256=hashlib.sha256(contents).hexdigest())
+    previous_umask = os.umask(0o777)
+    try:
+        if invalid_trailer:
+            with pytest.raises(ValueError, match="extension trailer differs"):
+                runtime.prepare_snapshot(artifact, descriptor, cache)
+        else:
+            target = runtime.prepare_snapshot(artifact, descriptor, cache)
+            assert target.read_bytes() == artifact.read_bytes()
+            assert runtime.prepare_snapshot(artifact, descriptor, cache) == target
+    finally:
+        os.umask(previous_umask)
+
+    assert not list(cache.rglob(".media-*"))
+    for path in (cache, *cache.rglob("*")):
+        assert stat.S_IMODE(path.stat().st_mode) == (0o700 if path.is_dir() else 0o400)
+    if invalid_trailer:
+        assert runtime._selected is None
+
+
+@pytest.mark.parametrize("in_process", [False, True])
+def test_custom_runtime_preparation_checks_boundary_even_when_already_loaded(snapshot_inputs, monkeypatch, in_process):
+    from vane import extensions
+
+    runtime, _, descriptor, _, source = snapshot_inputs
+    monkeypatch.setattr(runtime, "_override", source)
+    snapshot = [descriptor.to_dict()]
+    monkeypatch.setattr(extensions, "_capture_dynamic_extension_snapshot", lambda connection: snapshot)
+    if in_process:
+        extensions._prepare_dynamic_extension_snapshot(object(), snapshot, in_process=True)
+    else:
+        with pytest.raises(ValueError, match="official runtime"):
+            extensions._prepare_dynamic_extension_snapshot(object(), snapshot)
 
 
 @pytest.mark.parametrize(

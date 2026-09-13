@@ -261,6 +261,12 @@ struct PyPhysicalPlanWrapper {
 		result.serialized_root_ = serialize_root_for_clone();
 		result.ensure_plan_identity();
 		if (!conn_obj.is_none()) {
+			if (SnapshotHasDynamicExtensions(connection_snapshot_) &&
+			    ExtractPyConnectionWrapper(conn_obj).GetRunnerType() == "local") {
+				// Local fragment threads create their own DatabaseInstances. Prepare
+				// the selected process-local runtime before binding the cloned plan.
+				PrepareConnectionSnapshotExtensions(conn_obj, connection_snapshot_);
+			}
 			result.materialize_deferred_root(conn_obj);
 		}
 		return result;

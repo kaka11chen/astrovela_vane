@@ -1314,7 +1314,12 @@ static py::list NormalizeDynamicExtensionSnapshot(const py::object &snapshot_obj
 static py::list CaptureDynamicExtensionSnapshot(const py::object &conn_obj) {
 	try {
 		auto extensions_module = py::module_::import("vane.extensions");
-		auto snapshot = extensions_module.attr("_capture_dynamic_extension_snapshot_for_worker")(conn_obj);
+		// The local runner replays snapshots between DatabaseInstances in this
+		// process, where the selected custom runtime remains available.
+		const bool in_process = ExtractPyConnectionWrapper(conn_obj).GetRunnerType() == "local";
+		auto capture =
+		    in_process ? "_capture_dynamic_extension_snapshot" : "_capture_dynamic_extension_snapshot_for_worker";
+		auto snapshot = extensions_module.attr(capture)(conn_obj);
 		if (!py::isinstance<py::list>(snapshot)) {
 			throw duckdb::InternalException("Dynamic extension snapshot capture did not return a list");
 		}
@@ -1399,7 +1404,9 @@ static void ValidateWorkerRecordedDynamicExtensionSnapshot(DuckDBPyConnection &c
 static void PrepareDynamicExtensionSnapshot(py::object conn_obj, const py::list &dynamic_extensions) {
 	try {
 		auto extensions_module = py::module_::import("vane.extensions");
-		extensions_module.attr("_prepare_dynamic_extension_snapshot")(conn_obj, dynamic_extensions);
+		const bool in_process = ExtractPyConnectionWrapper(conn_obj).GetRunnerType() == "local";
+		extensions_module.attr("_prepare_dynamic_extension_snapshot")(conn_obj, dynamic_extensions,
+		                                                              py::arg("in_process") = in_process);
 	} catch (const py::error_already_set &exception) {
 		throw duckdb::InvalidInputException("Failed to prepare dynamic extension snapshot: %s", exception.what());
 	}
