@@ -201,14 +201,18 @@ def prepare_snapshot(artifact: Path, descriptor: DynamicExtensionDescriptor, cac
                 shutil.rmtree(staging)
 
 
-def distributed_runtime_selection(descriptors: Iterable[DynamicExtensionDescriptor]) -> str | None:
-    """Capture only the content identity explicitly authorized for Ray."""
+def distributed_runtime_selection(
+    descriptors: Iterable[DynamicExtensionDescriptor], *, required: bool = True
+) -> str | None:
+    """Capture the transport-authorized identity, requiring opt-in for workers."""
     references = [descriptor.native_runtime for descriptor in descriptors if descriptor.native_runtime is not None]
     if not references or _override is None:
         return None
     with _lock:
         if not _override_distributed:
-            raise ValueError("Ray custom native media requires allow_distributed=True; this runtime is local-only")
+            if required:
+                raise ValueError("Ray custom native media requires allow_distributed=True; this runtime is local-only")
+            return None
         for reference in references:
             source, _official, _signature, effective, manifest = _runtime_source(reference)
             fmt.verify_files(source / ".libs", manifest)

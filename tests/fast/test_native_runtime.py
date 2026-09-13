@@ -250,8 +250,11 @@ def test_distributed_custom_runtime_requires_explicit_opt_in(snapshot_inputs, mo
     from vane import extensions
 
     runtime, _, descriptor, _, source = snapshot_inputs
-    monkeypatch.setattr(extensions, "_capture_dynamic_extension_snapshot", lambda connection: [descriptor.to_dict()])
+    monkeypatch.setattr(
+        extensions, "_serialized_dynamic_extension_snapshot_entries", lambda connection: [descriptor.to_json()]
+    )
     runtime.use_native_media_runtime(source)
+    assert extensions._capture_dynamic_extension_snapshot(object()) == [descriptor.to_dict()]
     with pytest.raises(ValueError, match="allow_distributed=True"):
         extensions._capture_dynamic_extension_snapshot_for_worker(object())
     with pytest.raises(ValueError, match="start a new process"):
@@ -263,11 +266,14 @@ def test_distributed_snapshot_preserves_effective_identity_and_cache_isolation(s
 
     runtime, _, descriptor, _, source = snapshot_inputs
     original = [descriptor.to_dict()]
-    monkeypatch.setattr(extensions, "_capture_dynamic_extension_snapshot", lambda connection: [descriptor.to_dict()])
+    monkeypatch.setattr(
+        extensions, "_serialized_dynamic_extension_snapshot_entries", lambda connection: [descriptor.to_json()]
+    )
     runtime.use_native_media_runtime(source, allow_distributed=True)
     snapshot = extensions._capture_dynamic_extension_snapshot_for_worker(object())
     digest = hashlib.sha256((source / fmt.MANIFEST).read_bytes()).hexdigest()
     assert snapshot == [dict(descriptor.to_dict(), effective_runtime_sha256=digest)]
+    assert extensions._capture_dynamic_extension_snapshot(object()) == snapshot
     assert str(source) not in json.dumps(snapshot)
     assert extensions._normalize_dynamic_extension_snapshot(snapshot) == snapshot
     assert extensions._parse_dynamic_extension_snapshot(snapshot) == (descriptor,)

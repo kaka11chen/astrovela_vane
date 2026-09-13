@@ -968,22 +968,29 @@ def _serialized_dynamic_extension_snapshot_entries(connection: DuckDBPyConnectio
     return serialized_entries
 
 
-def _capture_dynamic_extension_snapshot(connection: DuckDBPyConnection) -> list[dict[str, object]]:
-    """Capture resolver-owned descriptors without serializing local paths."""
-    return _deserialize_dynamic_extension_snapshot_entries(_serialized_dynamic_extension_snapshot_entries(connection))
-
-
-def _capture_dynamic_extension_snapshot_for_worker(connection: DuckDBPyConnection) -> list[dict[str, object]]:
+def _capture_dynamic_extension_snapshot(
+    connection: DuckDBPyConnection, *, for_worker: bool = False
+) -> list[dict[str, object]]:
+    """Preserve authorized runtime identities across local and worker replay."""
     from vane._native_runtime import distributed_runtime_selection
 
-    snapshot = _capture_dynamic_extension_snapshot(connection)
+    snapshot = _deserialize_dynamic_extension_snapshot_entries(
+        _serialized_dynamic_extension_snapshot_entries(connection)
+    )
     descriptors = _parse_dynamic_extension_snapshot(snapshot)
-    selection = distributed_runtime_selection(descriptors)
+    # A local replay must recapture the same transport-authorized identity for
+    # the native manifest comparison. Local-only runtimes keep their existing
+    # in-process snapshots and are still rejected when captured for a worker.
+    selection = distributed_runtime_selection(descriptors, required=for_worker)
     if selection is not None:
         for entry, descriptor in zip(snapshot, descriptors, strict=True):
             if descriptor.native_runtime is not None:
                 entry[_RUNTIME_SELECTION_KEY] = selection
     return snapshot
+
+
+def _capture_dynamic_extension_snapshot_for_worker(connection: DuckDBPyConnection) -> list[dict[str, object]]:
+    return _capture_dynamic_extension_snapshot(connection, for_worker=True)
 
 
 def _deserialize_dynamic_extension_snapshot_entries(

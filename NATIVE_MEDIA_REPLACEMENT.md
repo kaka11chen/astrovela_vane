@@ -120,7 +120,8 @@ Do not put `VANE_NATIVE_MEDIA_RUNTIME` in a Ray Job or actor `runtime_env`.
 It is a node deployment setting and is not copied from the coordinator. Query
 snapshots carry only the expected content digest. Every process checks its
 independently authorized local runtime before admitting a query, including
-when reusing an existing connection. Missing authorization, changed bytes or
+when reusing an existing connection. Plans retain that digest when replayed by
+a local runner. Missing authorization, changed bytes or
 different digests fail before loading. An incompatible query cannot fall back
 to official libraries. Restart Ray processes when changing the runtime used by
 a deployment. Local selection without `allow_distributed=True` remains local.
