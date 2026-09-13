@@ -386,16 +386,27 @@ def pytest_configure(config):
         faulthandler.enable()
         timeout = int(os.getenv("TEST_TIMEOUT", "300"))
         faulthandler.dump_traceback_later(timeout, repeat=False)
-        # record that we scheduled a dump so we can cancel it in pytest_unconfigure
+        # Cancel when collection ends, including failed session startup.
         config._vane_faulthandler_dump_scheduled = True
     except Exception:
         # best-effort; don't fail pytest initialization if this doesn't work
         pass
 
 
-def pytest_unconfigure(config):
+def _cancel_collection_watchdog(config):
     try:
         if getattr(config, "_vane_faulthandler_dump_scheduled", False):
             faulthandler.cancel_dump_traceback_later()
+            config._vane_faulthandler_dump_scheduled = False
     except Exception:
         pass
+
+
+def pytest_collection_finish(session):
+    # Per-test timeouts take over once collection finishes. Leaving this timer
+    # armed would dump stacks in the middle of otherwise healthy tests.
+    _cancel_collection_watchdog(session.config)
+
+
+def pytest_unconfigure(config):
+    _cancel_collection_watchdog(config)
