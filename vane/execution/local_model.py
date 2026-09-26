@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import uuid
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
@@ -51,6 +52,7 @@ class LocalQueryModel:
 
     _definition: _PreparedBatchSQLRegistration
     _model: RegisteredLocalModel
+    _connection: weakref.ReferenceType[Any]
     _unnest: bool = False
 
     @property
@@ -64,7 +66,16 @@ class LocalQueryModel:
     def prewarm(self) -> None:
         """Initialize this registration's pool without retaining a query borrow."""
         _native._check_python_callback_entry()
-        self._model.prewarm()
+        connection = self._connection()
+        if connection is None:
+            raise RuntimeError("the local model's owning connection is closed")
+        try:
+            # Keep the shutdown owner alive until initialization and borrow
+            # cleanup finish, including when the caller drops the connection.
+            self._model.prewarm()
+        finally:
+            # A retained initialization exception must not extend ownership.
+            del connection
 
     def __call__(self, *args: Any) -> Any:
         _native._check_python_callback_entry()

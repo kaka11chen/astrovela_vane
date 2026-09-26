@@ -221,6 +221,75 @@ def test_retained_model_does_not_keep_its_owner_connection_alive(tmp_path):
         model.prewarm()
 
 
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("fail_initialization", [False, True])
+def test_prewarm_retains_shutdown_owner_until_initialization_finishes(tmp_path, batch, fail_initialization):
+    directory = str(tmp_path)
+
+    class SlowInit:
+        def __init__(self):
+            Path(directory, "initialized").write_text(str(os.getpid()))
+            Path(directory, "entered").touch()
+            deadline = time.monotonic() + 20
+            while not Path(directory, "release").exists():
+                if time.monotonic() > deadline:
+                    raise TimeoutError("prewarm fixture gate was not released")
+                time.sleep(0.01)
+            if fail_initialization:
+                raise ValueError("prewarm initialization fixture failure")
+
+        def __call__(self, value):
+            return value
+
+    decorate = vane.cls.batch if batch else vane.cls
+    definition = decorate(actor_number=1, return_dtype="BIGINT")(SlowInit)()
+    connection = vane.connect()
+    runtime = _runtime(connection)
+    model = _register(runtime, definition)
+    owner = weakref.ref(connection)
+    runtime_owner = weakref.ref(runtime)
+    registry = model._model._registry
+    try:
+        with ThreadPoolExecutor(max_workers=1) as clients:
+            prewarm = clients.submit(model.prewarm)
+            try:
+                deadline = time.monotonic() + 10
+                while not (tmp_path / "entered").exists():
+                    assert time.monotonic() < deadline, "model initialization did not start"
+                    time.sleep(0.01)
+                pid = int((tmp_path / "initialized").read_text())
+                del connection, runtime
+                gc.collect()
+                assert owner() is not None
+                assert runtime_owner() is not None
+                state = registry.resource_snapshot()
+                assert not state["draining"]
+                assert state["initializing_resources"] == ResourceVector(cpu=1, heap_bytes=4096).to_dict()
+            finally:
+                (tmp_path / "release").touch()
+
+            # Keep the future (and any error traceback) alive to verify that
+            # it does not retain the connection after the prewarm attempt.
+            error = prewarm.exception(timeout=10)
+            if fail_initialization:
+                assert error is not None and "prewarm initialization fixture failure" in str(error)
+            else:
+                assert error is None
+
+        gc.collect()
+        assert owner() is None
+        assert runtime_owner() is None
+        state = registry.resource_snapshot()
+        assert state["closed"]
+        assert state["active_borrows"] == 0
+        assert state["reserved_resources"] == ResourceVector().to_dict()
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    finally:
+        (tmp_path / "release").touch()
+        registry.close(timeout=10, kill=True)
+
+
 @pytest.mark.parametrize("resource", ["cpu", "heap"])
 def test_registered_model_obeys_resident_capacity(tmp_path, resource):
     with vane.connect() as connection:

@@ -360,8 +360,10 @@ Worker loss fails the affected request without replay; a new request may start
 a replacement worker. Initialization failure follows the existing sticky failure
 contract. Drain rejects new registration, expression construction and prewarm;
 already claimed requests retain their preparation capability. Connection close
-drains requests and then releases resident models. Retaining a model object does
-not keep its owning connection alive.
+drains requests and then releases resident models. An in-progress `prewarm()`
+keeps its owning connection alive through initialization and borrow cleanup,
+including initialization failure. An idle model handle does not retain the
+connection.
 
 Model registration, expression construction, attachment and prewarm obey the
 Python input callback reentry rule. Use them outside input/filesystem callbacks.

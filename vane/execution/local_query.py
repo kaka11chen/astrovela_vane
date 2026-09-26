@@ -151,7 +151,7 @@ class LocalQueryRuntime:
         )
         payload = collect_model_payload(connection, definition)
         registered = self._runtime.register(name, version=version, payload=payload)
-        return LocalQueryModel(definition, registered, unnest)
+        return LocalQueryModel(definition, registered, weakref.ref(connection), unnest)
 
     def _execute(
         self, execute: Callable[[_NativeQuery], None], publish: Callable[[LocalModelRequest | None], None]
