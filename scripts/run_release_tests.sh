@@ -27,7 +27,15 @@ export VANE_FAST_TEST_ARTIFACT_MODE=1
 # separately because they need additional dependencies or infrastructure.
 release_tests=(
   "$project_root/tests/fast/test_ai_release_contracts.py"
+  "$project_root/tests/fast/test_ai_client_config.py"
+  "$project_root/tests/fast/test_ai_embedding_requests.py"
+  "$project_root/tests/fast/test_ai_image_embedding.py"
+  "$project_root/tests/fast/test_ai_video_embedding.py"
+  "$project_root/tests/fast/test_ai_audio_embedding.py"
+  "$project_root/tests/fast/test_clap.py"
+  "$project_root/tests/fast/test_cosmos_embed1.py"
   "$project_root/tests/fast/test_datasink.py"
+  "$project_root/tests/fast/test_distributed_aggregates.py"
   "$project_root/tests/fast/test_doris_datasink.py"
   "$project_root/tests/fast/test_extension_catalog.py"
   "$project_root/tests/fast/test_milvus_datasink.py"
@@ -118,5 +126,11 @@ python -m pytest \
 
 python -m pytest \
   "${pytest_args[@]}" \
-  -m "not external_service and real_ray" \
+  -m "not external_service and real_ray and not ray_cluster_owner" \
+  "${release_tests[@]}"
+
+# Tests which start their own cluster must not share a process with Ray fixtures.
+python -m pytest \
+  "${pytest_args[@]}" \
+  -m "not external_service and real_ray and ray_cluster_owner" \
   "${release_tests[@]}"

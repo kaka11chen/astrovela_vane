@@ -14,6 +14,7 @@ from vane.runners.ray.query_resource_graph import (
     ResourceUnitSpec,
     ResourceVector,
 )
+from vane.runners.ray.query_resource_graph_builder import build_query_resource_graph
 from vane.runners.ray.query_resource_manager import (
     OutputBlockRequest,
     RayQueryResourceManager,
@@ -694,13 +695,219 @@ def test_native_unit_completes_only_after_production_and_all_fragments(seal_befo
         manager.register_native_fragment(key, "q", "final:2")
 
 
-def test_empty_native_production_completes_only_native_units():
-    native = _unit("resource:f:empty", backend="ray_worker", target=0, blocks=0)
+def test_native_production_seal_never_completes_memberless_units():
+    # A native unit without registered fragments is fused into another unit's
+    # tasks (or never ran). Sealing production is not evidence that it
+    # finished, so it must stay uncompleted (regression for #835).
+    native = _unit("resource:f:fused", backend="ray_worker", target=0, blocks=0)
     udf = _unit("resource:f:udf", backend="ray_task", target=0, blocks=0)
-    manager = _manager(native, udf, terminals=(native.resource_unit_id, udf.resource_unit_id))
+    changes = []
+    manager = _manager(
+        native,
+        udf,
+        terminals=(native.resource_unit_id, udf.resource_unit_id),
+        on_eligible_units_change=lambda *args: changes.append(args),
+    )
     manager.seal_native_fragment_production()
-    assert manager.snapshot()["units"][native.resource_unit_id]["completed"] is True
+    assert manager.snapshot()["units"][native.resource_unit_id]["completed"] is False
     assert manager.snapshot()["units"][udf.resource_unit_id]["completed"] is False
+    assert changes == []
+
+
+def _fused_udf_chain_graph():
+    """Audio-benchmark shape: one fused FTE fragment hosts every native node.
+
+    Pipeline node ids are assigned post-order, so the scan is node 1 and the
+    COPY sink is node 8; each remote UDF feeds its parent's native unit.
+    """
+
+    def udf(node_id, backend, **extra):
+        payload = {
+            "execution_backend": backend,
+            "resource_unit_id": f"resource:q:udf:node:{node_id}",
+            "query_id": "q",
+            "cpus": 1.0,
+            "gpus": 0.0,
+            "udf_output_target_max_bytes": 100,
+            "udf_task_input_max_bytes": 100,
+        }
+        payload.update(extra)
+        return payload
+
+    def node(node_id, name, inputs, *, sink=False, udf_payload=None):
+        return {
+            "node_id": str(node_id),
+            "node_name": name,
+            "input_node_ids": [str(item) for item in inputs],
+            "is_sink": sink,
+            "is_materialization_barrier": False,
+            "materialized_input_node_ids": [],
+            "num_partitions": 1,
+            "udf_payload": udf_payload,
+        }
+
+    return build_query_resource_graph(
+        {
+            "query_id": "q",
+            "nodes": [
+                node(1, "ScanSource", []),
+                node(2, "Projection", [1]),
+                node(3, "resample", [2], udf_payload=udf(3, "ray_task")),
+                node(4, "whisper_preprocess", [3], udf_payload=udf(4, "ray_task")),
+                node(5, "Transcriber", [4], udf_payload=udf(5, "ray_actor", actor_pool_size=1, gpus=1.0)),
+                node(6, "decode", [5], udf_payload=udf(6, "ray_task")),
+                node(7, "Projection", [6]),
+                node(8, "CopySink", [7], sink=True),
+            ],
+            "terminal_node_ids": ["8"],
+        },
+        env={},
+    )
+
+
+def test_production_seal_keeps_fused_udf_consumers_live():
+    """Regression for #835: sealing must not disable UDF output liveness."""
+    graph = _fused_udf_chain_graph()
+    changes = []
+    manager = RayQueryResourceManager(
+        graph,
+        _allocation(_r(cpu=100, gpu=1, store=1_000)),
+        on_eligible_units_change=lambda *args: changes.append(args),
+    )
+    for unit in graph.units:
+        manager.update_unit_state(unit.resource_unit_id, runnable=not unit.input_unit_ids)
+    scan = "resource:q:fragment:node:1"
+    manager.register_native_fragment(scan, "q", "q:node:1")
+    manager.update_native_fragment_state(scan, "q", "q:node:1", version=1, runnable=True, completed=False)
+
+    manager.seal_native_fragment_production()
+
+    fused = [f"resource:q:fragment:node:{node_id}" for node_id in range(2, 9)]
+    units = manager.snapshot()["units"]
+    assert [units[unit_id]["completed"] for unit_id in fused] == [False] * len(fused)
+    assert set(fused) <= set(manager.current_eligible_resource_unit_ids())
+    assert changes == []
+
+    producer = "resource:q:udf:node:4"
+    request = _task(producer, 0)
+    manager.note_task_waiting(request)
+    task = manager.try_acquire_queued_task(request)
+    assert task.granted
+    # A block larger than the whole soft budget can only cross via liveness,
+    # which requires the fused consumer (node 5) to count as starving.
+    grant = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            query_id="q",
+            producer_unit_id=producer,
+            task_lease_id=task.lease.lease_id,
+            attempt_id=task.lease.attempt_id,
+            block_id="whisper:0:block:0",
+            size_bytes=2_000,
+        )
+    )
+    assert grant.granted, grant.blocked_reason
+    assert grant.lease.liveness is True
+
+
+@pytest.mark.parametrize("late_native_nodes", [(), (2,)])
+def test_sealed_fused_nodes_keep_dependencies_without_reserving_object_store(late_native_nodes):
+    graph = _fused_udf_chain_graph()
+    wakeups = []
+    frontier_changes = []
+    manager = RayQueryResourceManager(
+        graph,
+        _allocation(_r(cpu=100, gpu=1, store=1_000)),
+        on_change=lambda: wakeups.append("changed"),
+        on_eligible_units_change=lambda *args: frontier_changes.append(args),
+    )
+    scan = "resource:q:fragment:node:1"
+    manager.register_native_fragment(scan, "q", "scan")
+    manager.update_native_fragment_state(scan, "q", "scan", version=1, runnable=True, completed=False)
+    before = manager.snapshot()
+    # Until the outer producer closes, a node can still receive a real native
+    # fragment. Even a not-yet-runnable member must retain its reservation.
+    for node_id in late_native_nodes:
+        manager.register_native_fragment(f"resource:q:fragment:node:{node_id}", "q:stage", "late")
+    assert manager.snapshot()["admission"]["reservation_unit_ids"] == before["admission"]["reservation_unit_ids"]
+    wakeups.clear()
+
+    manager.seal_native_fragment_production()
+
+    after = manager.snapshot()
+    actual_owners = {scan, *(f"resource:q:fragment:node:{node}" for node in late_native_nodes)}
+    actual_owners.update(f"resource:q:udf:node:{node}" for node in range(3, 7))
+    assert set(after["admission"]["reservation_unit_ids"]["object_store_bytes"]) == actual_owners
+    assert after["execution_phase"] == before["execution_phase"]
+    assert after["allocation_fence_epoch"] == before["allocation_fence_epoch"]
+    assert frontier_changes == []
+    assert wakeups == ["changed"]
+    for key in after["native_membership"]["memberless_unit_ids"]:
+        assert after["units"][key]["completed"] is False
+        assert after["units"][key]["object_store_budget"]["task_reserved_bytes"] == 0
+        assert after["units"][key]["object_store_budget"]["output_reserved_bytes"] == 0
+    _assert_object_store_budget_invariants(after)
+    manager.seal_native_fragment_production()
+    assert wakeups == ["changed"]
+
+
+def test_seal_reclaims_fused_reservations_for_concurrent_downstream_tasks():
+    native = _unit("resource:f:scan-owner", backend="ray_worker", target=200, blocks=2)
+    units = [native]
+    for index in range(8):
+        units.append(_unit(f"resource:f:fused-{index}", backend="ray_worker", inputs=(units[-1].resource_unit_id,)))
+    preprocess = _unit("resource:f:features", inputs=(units[-1].resource_unit_id,), target=100, blocks=1)
+    manager = _manager(*units, preprocess)
+    manager.register_native_fragment(native.resource_unit_id, "q", "scan")
+    manager.update_native_fragment_state(
+        native.resource_unit_id, "q", "scan", version=1, runnable=True, completed=False
+    )
+    _ready(manager, preprocess.resource_unit_id)
+    native_task = manager.try_acquire_task(_task(native.resource_unit_id, 0, node_id="node-a"))
+    first = manager.try_acquire_task(_task(preprocess.resource_unit_id, 0))
+    assert native_task.granted and not native_task.liveness
+    assert first.granted and not first.liveness
+    second_request = _task(preprocess.resource_unit_id, 1)
+    assert manager._normal_task_block_reason_locked(second_request)[0] == "unit_soft_object_store_bytes"
+    assert not manager.try_acquire_task(second_request).granted
+    before = manager.snapshot()
+
+    manager.seal_native_fragment_production()
+
+    # No task completed and no capacity/estimate changed. Reclaiming the
+    # non-owners' reservations alone permits a second ordinary UDF task.
+    assert manager.snapshot()["usage"] == before["usage"]
+    second = manager.try_acquire_task(second_request)
+    assert second.granted and not second.liveness
+    assert first.lease.lease_id in manager.snapshot()["task_leases"]
+    _assert_object_store_budget_invariants(manager.snapshot())
+
+
+def test_sealed_memberless_unit_retains_live_accounting_and_output_handoff():
+    native = _unit("resource:f:owner", backend="ray_worker", target=10, blocks=1)
+    fused = _unit("resource:f:fused", backend="ray_worker", inputs=(native.resource_unit_id,), target=10, blocks=1)
+    manager = _manager(native, fused)
+    manager.register_native_fragment(native.resource_unit_id, "q", "scan")
+    _ready(manager, fused.resource_unit_id)
+    task = manager.try_acquire_task(_task(fused.resource_unit_id, 0, node_id="node-a"))
+    assert task.granted
+    before = manager.snapshot()
+
+    manager.seal_native_fragment_production()
+
+    after = manager.snapshot()
+    assert after["usage"] == before["usage"]
+    assert after["admission"]["object_store"]["ineligible_usage_bytes"] == 10
+    outputs = manager.finish_task_with_outputs(
+        task.lease.lease_id,
+        attempt_id=task.lease.attempt_id,
+        outputs=[
+            OutputBlockRequest("q", fused.resource_unit_id, task.lease.lease_id, task.lease.attempt_id, "late", 37)
+        ],
+    )
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 37
+    _assert_object_store_budget_invariants(manager.snapshot())
+    assert manager.release_output_block(outputs[0].lease_id)
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 0
 
 
 def test_native_membership_placeholder_survives_producer_seal_and_reordered_snapshots():

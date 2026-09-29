@@ -6,14 +6,18 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from vane.ai._redaction import is_sensitive_option_key
 from vane.ai.functions import (
     _PROMPT_PACKED_INPUT_COLUMN,
     _actor_number_or_one,
     _adapt_batch_wrapper_for_backend,
+    _embed_function_name,
+    _EmbedAudioBatch,
+    _EmbedImageBatch,
     _EmbedTextBatch,
+    _EmbedVideoBatch,
     _gpus_or_zero,
     _prepare_embed_call,
     _prepare_prompt_call,
@@ -126,7 +130,7 @@ def build_ai_prompt_sql_spec(
     system_message: str | None = None,
     on_error: str = "raise",
     options: dict[str, Any] | None = None,
-    input_kind: str = "text",
+    input_kind: Literal["text", "blob", "blob_list", "file", "file_list"] = "text",
     return_format: str | dict[str, Any] | None = None,
     return_raw_response: bool = False,
 ) -> dict[str, Any]:
@@ -252,6 +256,8 @@ def build_ai_embed_sql_spec(
     dimensions: int | None = None,
     on_error: str = "raise",
     options: dict[str, Any] | None = None,
+    *,
+    input_kind: Literal["text", "image", "video", "audio"] = "text",
 ) -> dict[str, Any]:
     opts = _normalize_sql_options(options)
     descriptor, resolved_dimensions, udf_opts, normalize, _, _, _ = _prepare_embed_call(
@@ -261,10 +267,18 @@ def build_ai_embed_sql_spec(
         on_error,
         opts,
         relation=False,
+        input_kind=input_kind,
     )
-    wrapper = _EmbedTextBatch(
+    input_name = {"text": "text", "image": "image", "video": "frames", "audio": "audio"}[input_kind]
+    wrapper_class = {
+        "text": _EmbedTextBatch,
+        "image": _EmbedImageBatch,
+        "video": _EmbedVideoBatch,
+        "audio": _EmbedAudioBatch,
+    }[input_kind]
+    wrapper = wrapper_class(
         descriptor,
-        "text",
+        input_name,
         "embedding",
         resolved_dimensions,
         max_retries=udf_opts.max_retries,
@@ -274,15 +288,50 @@ def build_ai_embed_sql_spec(
     actor_callable = _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True)
     return {
         "function": actor_callable,
-        "name": "ai_embed",
+        "name": _embed_function_name(input_kind),
         "provider": descriptor.get_provider(),
         "model": descriptor.get_model(),
         "dimensions": resolved_dimensions,
         "return_type": _embedding_output_type(resolved_dimensions),
-        "input_names": ["text"],
+        "input_names": [input_name],
         "schema": {"embedding": _embedding_output_type(resolved_dimensions)},
         "batch_size": _resolve_ai_batch_size(udf_opts),
         "row_preserving": True,
         "actor_number": _actor_number_or_one(udf_opts),
         "gpus": _gpus_or_zero(udf_opts),
+    }
+
+
+def build_ai_jev_sql_spec(
+    questions: str | dict[str, Any],
+    model: str = "jev-latest",
+    on_error: Literal["raise", "ignore"] = "raise",
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build Jev's actor UDF with the same request contract as the Python API."""
+    from vane.ai._jev import _prepare_jev_call
+
+    opts = _normalize_sql_options(options)
+    if "execution_backend" in opts:
+        raise TypeError("Jev SQL uses the connection's actor backend; execution_backend is a Python-only option")
+    if isinstance(questions, str):
+        try:
+            questions = json.loads(questions)
+        except json.JSONDecodeError:
+            raise ValueError("ai_jev questions must be valid JSON") from None
+    if not isinstance(questions, dict) or not questions:
+        raise ValueError("ai_jev questions must be a non-empty JSON object or STRUCT")
+    wrapper, udf_opts = _prepare_jev_call(questions, model, on_error, opts)
+    return {
+        "function": _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True),
+        "name": "ai_jev",
+        "provider": "typesafe",
+        "model": model,
+        "return_type": "VARCHAR",
+        "input_names": ["state"],
+        "schema": {"response": "VARCHAR"},
+        "batch_size": _resolve_ai_batch_size(udf_opts),
+        "row_preserving": True,
+        "actor_number": _actor_number_or_one(udf_opts),
+        "gpus": 0,
     }

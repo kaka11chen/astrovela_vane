@@ -317,7 +317,22 @@ public:
 		if (!Enabled() || current_rebind == RebindQueryInfo::ATTEMPT_TO_REBIND) {
 			return RebindQueryInfo::DO_NOT_REBIND;
 		}
+		if (prepared_statements.find(&info.prepared_statement) == prepared_statements.end() &&
+		    HasLocalActorUDF(info.prepared_statement)) {
+			// Cached plans retain their bind data, including handles of pools
+			// closed at the previous QueryEnd. Rebind before a new execution.
+			return RebindQueryInfo::ATTEMPT_TO_REBIND;
+		}
 		PrepareOnce(context, info.prepared_statement);
+		return RebindQueryInfo::DO_NOT_REBIND;
+	}
+
+	RebindQueryInfo OnRebindPreparedStatement(ClientContext &, BindPreparedStatementCallbackInfo &info,
+	                                          RebindQueryInfo current_rebind) override {
+		if (Enabled() && current_rebind != RebindQueryInfo::ATTEMPT_TO_REBIND &&
+		    HasLocalActorUDF(info.prepared_statement)) {
+			return RebindQueryInfo::ATTEMPT_TO_REBIND;
+		}
 		return RebindQueryInfo::DO_NOT_REBIND;
 	}
 
@@ -367,6 +382,21 @@ public:
 	}
 
 private:
+	static bool HasLocalActorUDF(PreparedStatementData &prepared) {
+		if (!prepared.physical_plan || !prepared.physical_plan->HasRoot()) {
+			return false;
+		}
+		vector<UDFFunctionData *> bind_nodes;
+		CollectMutableUDFBindDataRecursive(prepared.physical_plan->Root(), bind_nodes);
+		for (auto *bind_data : bind_nodes) {
+			string backend;
+			if (PayloadStringField(bind_data->payload, "execution_backend", backend) && backend == "subprocess_actor") {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	bool Enabled() const {
 		return scope_depth > 0;
 	}

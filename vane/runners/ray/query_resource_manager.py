@@ -284,6 +284,10 @@ class RayQueryResourceManager:
         # seals membership; a fragment's no_more_partitions does not.
         self._native_production_sealed = False
         self._native_fragments: dict[str, dict[tuple[str, str], _NativeFragmentState]] = {}
+        # Native units without registered fragments at seal time. Such units
+        # are fused into another unit's tasks (or never ran); the seal must
+        # not retire them (see seal_native_fragment_production).
+        self._memberless_native_unit_ids: tuple[str, ...] = ()
 
     def _publish_change_locked(self) -> None:
         """Publish a non-blocking local wakeup after an accounting mutation.
@@ -419,7 +423,14 @@ class RayQueryResourceManager:
         return self._update_unit_state_locked(
             unit_key,
             runnable=any(state.runnable for state in fragments.values()),
-            completed=self._native_production_sealed and all(state.completed for state in fragments.values()),
+            # Completion is irreversible and needs positive evidence: at
+            # least one registered fragment, all of them completed, and a
+            # sealed producer. A unit without fragments is fused into
+            # another unit's tasks (or never ran); all() over no fragments
+            # must not retire it (#835).
+            completed=bool(fragments)
+            and self._native_production_sealed
+            and all(state.completed for state in fragments.values()),
         )
 
     def seal_native_fragment_production(self) -> None:
@@ -427,20 +438,45 @@ class RayQueryResourceManager:
 
         Existing partitions may still receive input or retry. Internal ORDER BY
         stage/sample/range waits never close this query-wide producer.
+
+        Units without registered fragments keep their state: no membership
+        is not evidence of completion (#835).
         """
         callback = None
+        memberless: tuple[str, ...] = ()
         with self._lock:
             if self._native_production_sealed or self._cancelled or self._failed:
                 return
             self._native_production_sealed = True
             changed = False
+            memberless_units: list[str] = []
             for unit_key, unit in self._units.items():
-                if unit.spec.backend == "ray_worker":
-                    changed = self._aggregate_native_unit_locked(unit_key) or changed
+                if unit.spec.backend != "ray_worker":
+                    continue
+                if unit_key not in self._native_fragments:
+                    memberless_units.append(unit_key)
+                    continue
+                changed = self._aggregate_native_unit_locked(unit_key) or changed
+            memberless = tuple(memberless_units)
+            self._memberless_native_unit_ids = memberless
+            if memberless:
+                # Sealed membership proves these dependency nodes cannot own
+                # independent native tasks. Reclaim their reservations without
+                # completing them: fused consumers still provide UDF liveness.
+                # Wake queued admissions even if no runnable state changed.
+                self._publish_change_locked()
             if changed:
                 callback = self._on_eligible_units_change
                 eligible = self._eligible_resource_unit_ids_locked()
                 epoch = self._allocation_fence_epoch
+        if memberless and self._native_fragments:
+            logger.warning(
+                "query %s sealed native production with %d memberless native unit(s) "
+                "(fused into other units' tasks or never ran): %s",
+                self.graph.query_id,
+                len(memberless),
+                ", ".join(memberless),
+            )
         if callback is not None:
             callback(eligible, epoch)
 
@@ -1411,6 +1447,10 @@ class RayQueryResourceManager:
         future node placement defines the reservation set. Operators may
         temporarily receive less than one invocation's minimum; their real
         requests can still enter Ray Core through the bounded liveness escape.
+
+        Once native production is sealed, memberless native nodes only carry
+        dependencies. They must not dilute the real producers' object-store
+        shares. Before seal, retain reservations for possible late fragments.
         """
 
         eligible = set(self._eligible_resource_unit_ids_locked())
@@ -1420,6 +1460,7 @@ class RayQueryResourceManager:
             if resource_unit_id in eligible
             and not self._units[resource_unit_id].completed
             and self._unit_uses_dimension(self._units[resource_unit_id].spec, field_name)
+            and (field_name != "object_store_bytes" or resource_unit_id not in self._memberless_native_unit_ids)
         )
         if requested_unit_id is not None and requested_unit_id not in selected:
             raise RuntimeError(f"unit {requested_unit_id} requested undeclared {field_name} capacity")
@@ -2735,6 +2776,14 @@ class RayQueryResourceManager:
                     "eligible_resource_unit_ids": list(eligible_unit_ids),
                     "completed_barrier_ids": sorted(self._completed_materialization_barrier_ids),
                     "object_store_unlimited_unit_ids": list(object_store_unlimited_unit_ids),
+                },
+                "native_membership": {
+                    "production_sealed": bool(self._native_production_sealed),
+                    "memberless_unit_ids": list(self._memberless_native_unit_ids),
+                    "unit_fragment_ids": {
+                        unit_key: [f"{query_id}:{fragment_id}" for query_id, fragment_id in fragments]
+                        for unit_key, fragments in self._native_fragments.items()
+                    },
                 },
                 "cancelled": self._cancelled,
                 "cancel_reason": self._cancel_reason,

@@ -71,10 +71,20 @@ qdrant = ["qdrant-client>=1.19.0,<2"]
 openai = ["openai>=1.66.0", "tiktoken"] # floor adds the Responses API used by the default Prompt path
 anthropic = ["anthropic>=0.117.0"] # floor matches the Messages.create option surface validated in vane/ai/providers/anthropic.py
 google = ["google-genai>=1.22.0"] # floor adds GenerateContentConfig.response_json_schema
+typesafe = ["typesafe-sdk>=0.7.0,<0.8"] # validated AsyncTypeSafeClient System One API
 transformers = [
-    "sentence-transformers",
+    "sentence-transformers>=5.1",
     "torch",
     "transformers",
+    "pillow>=10.4",
+]
+clap = ["torch>=2.6", "transformers>=4.51.3,<5"]
+cosmos = [
+    "torch>=2.7",
+    "torchvision>=0.22",
+    "transformers==4.51.3",
+    "einops>=0.8",
+    "pillow>=10.4",
 ]
 vllm = [
     "vllm>=0.11.0; platform_system == 'Linux' and platform_machine == 'x86_64'", # floor adds structured_outputs
@@ -99,6 +109,7 @@ video = [ # VideoFile metadata and distributed frame streaming
 all = [ # Cloud providers and dataframe/filesystem integrations; local model runtimes stay opt-in.
     "anthropic>=0.117.0",
     "google-genai>=1.22.0",
+    "typesafe-sdk>=0.7.0,<0.8",
     "ipython", # used in query_graph
     "fsspec",  # used in filesystem support
     "openai>=1.66.0",
@@ -271,7 +282,15 @@ include = [
     "/tests/ray_test_profile.py",
     "/tests/result_stream_helpers.py",
     "/tests/fast/test_ai_release_contracts.py",
+    "/tests/fast/test_ai_client_config.py",
+    "/tests/fast/test_ai_embedding_requests.py",
+    "/tests/fast/test_ai_image_embedding.py",
+    "/tests/fast/test_ai_video_embedding.py",
+    "/tests/fast/test_ai_audio_embedding.py",
+    "/tests/fast/test_clap.py",
+    "/tests/fast/test_cosmos_embed1.py",
     "/tests/fast/test_datasink.py",
+    "/tests/fast/test_distributed_aggregates.py",
     "/tests/fast/test_doris_datasink.py",
     "/tests/fast/test_extension_catalog.py",
     "/tests/fast/test_milvus_datasink.py",
@@ -314,6 +333,7 @@ include = [
     "/tests/fast/test_ray_udf_plan_replay.py",
 
     # Source code and stubs
+    "/examples/jev_judgments.py",
     "src/**",
     "vane/**",
 
@@ -507,6 +527,7 @@ ai-test = [ # dependencies used for running tests/ai
     "pytest-timeout",
     "pytest-timestamper",
     "tiktoken",
+    "typesafe-sdk>=0.7.0,<0.8",
     "typing-extensions",
 ]
 test = [ # dependencies used for running the complete test suite
@@ -648,6 +669,8 @@ module = [
     "torch",
     "tensorflow",
     "tiktoken",
+    "typesafe_sdk",
+    "typesafe_sdk.*",
     "vllm",
     "vllm.*",
 ]
