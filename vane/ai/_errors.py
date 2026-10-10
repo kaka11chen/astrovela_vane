@@ -32,50 +32,6 @@ _ENGINE_OPTIONS = frozenset(
         "is_embedding",
     }
 )
-_ERROR_TYPES = frozenset(
-    {
-        "TypeError",
-        "ValueError",
-        "RuntimeError",
-        "AssertionError",
-        "ImportError",
-        "ModuleNotFoundError",
-        "MemoryError",
-        "OutOfMemoryError",
-        "OutOfMemoryException",
-        "TimeoutError",
-        "GetTimeoutError",
-        "ConnectionError",
-        "ConnectionRefusedError",
-        "PermissionError",
-        "FileNotFoundError",
-        "OSError",
-        "ActorDiedError",
-        "RayActorError",
-        "RayTaskError",
-        "InvalidDataError",
-        "InvalidInputException",
-        "ProviderImportError",
-        "ProviderCapabilityError",
-        "EmbeddingConfigurationError",
-        "HTTPStatusError",
-        "APIStatusError",
-        "APIConnectionError",
-        "APITimeoutError",
-        "AuthenticationError",
-        "PermissionDeniedError",
-        "NotFoundError",
-        "BadRequestError",
-        "RateLimitError",
-        "InternalServerError",
-        "ConnectError",
-        "ReadError",
-        "ReadTimeout",
-        "ConnectTimeout",
-        "RemoteProtocolError",
-        "SSLCertVerificationError",
-    }
-)
 _FRACTION = r"(?:0(?:\.[0-9]{1,6})?|1(?:\.0{1,6})?)"
 _UNEXPECTED = re.compile(
     r"(?:[A-Za-z_][A-Za-z_0-9.]{0,127}\(\) )?got an unexpected keyword argument "
@@ -89,7 +45,7 @@ _SAFE_MEMORY = re.compile(
     rf"insufficient GPU KV-cache memory; mem_fraction_static=({_FRACTION}), required above ({_FRACTION})(?![0-9.])"
 )
 _PROVIDER_SUMMARY = re.compile(r"upstream error: ([^\n]{1,4096})")
-_TYPE = re.compile(r"[A-Za-z_][A-Za-z_0-9]{0,127}")
+_TYPE = re.compile(r"[A-Za-z_][A-Za-z_0-9]{0,127}(?!\w)")
 _STATUS_FIELD = r"(?:status_code|status|code|errno)=-?[0-9]{1,6}"
 _STATUS_GROUP = re.compile(rf" \({_STATUS_FIELD}(?:, {_STATUS_FIELD}){{0,3}}\)")
 
@@ -114,7 +70,7 @@ def _type_name(error: BaseException) -> str:
         name = type.__getattribute__(type(error), "__name__")
     except BaseException:
         return "Exception"
-    return name if type(name) is str and len(name) <= 128 and name.isascii() and name.isidentifier() else "Exception"
+    return name if type(name) is str and _TYPE.fullmatch(name) else "Exception"
 
 
 def technical_detail(error_type: str, message: str, *, transported: bool = False) -> str | None:
@@ -196,7 +152,9 @@ def _transported_summary(message: str) -> str:
         match = _TYPE.match(message, position)
         if match is None:
             break
-        name = match[0] if match[0] in _ERROR_TYPES else "ProviderError"
+        # The producer already sanitizes names with this same bounded grammar.
+        # Preserve SDK/catalog types without a dependency-specific allowlist.
+        name = match[0]
         position = match.end()
         rendered = name
         status = _STATUS_GROUP.match(message, position)

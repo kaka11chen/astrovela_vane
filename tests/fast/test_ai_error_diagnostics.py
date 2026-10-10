@@ -8,7 +8,7 @@ import pickle
 import pytest
 
 from vane.ai import summarize_error
-from vane.ai.provider import _safe_provider_execution_error
+from vane.ai.provider import ProviderCapabilityError, _safe_provider_execution_error
 
 
 @pytest.mark.parametrize(
@@ -42,6 +42,55 @@ def test_diagnostic_survives_provider_pickle_and_native_query_transport(error, e
     for result in (summarize_error(error), summarize_error(public), summarize_error(flattened)):
         assert expected in result
         assert "private" not in result
+
+
+@pytest.mark.parametrize(
+    "kind,expected",
+    [
+        ("arrow", "ArrowInvalid"),
+        ("google_client", "ClientError (code=429)"),
+        ("google_server", "ServerError (code=503)"),
+        ("custom", "CustomSDKError (status_code=502)"),
+    ],
+)
+@pytest.mark.parametrize("wrapper", ["execution", "capability"])
+def test_sdk_types_survive_repeated_provider_and_native_transport(kind, expected, wrapper):
+    if kind == "arrow":
+        import pyarrow as pa
+
+        error = pa.ArrowInvalid("private catalog content")
+    elif kind.startswith("google_"):
+        errors = pytest.importorskip("google.genai.errors")
+        error_type, code = (errors.ClientError, 429) if kind == "google_client" else (errors.ServerError, 503)
+        error = error_type(code, {"error": {"message": "private response body", "status": "private-status"}})
+    else:
+        error = type("CustomSDKError", (Exception,), {"status_code": 502})("private request")
+    assert summarize_error(error) == expected
+    for _ in range(3):
+        if wrapper == "execution":
+            public = _safe_provider_execution_error("fixture", "private-model", "embed", error)
+        else:
+            public = ProviderCapabilityError("fixture", "private-model", "embed", original_error=error)
+        serialized = pickle.dumps(public)
+        assert b"private response" not in serialized and b"private catalog" not in serialized
+        restored = pickle.loads(serialized)
+        error = RuntimeError(json.dumps({"exception_message": "private SQL\n" + str(restored)}))
+        for candidate in (public, restored, error):
+            assert summarize_error(candidate) == expected
+
+
+@pytest.mark.parametrize("name", ["E" * 128, "E" * 129, "Error-Name", "错误", "Error\nprivate"])
+def test_exception_type_sanitization_is_consistent_across_transport(name):
+    error = type(name, (Exception,), {})("private source")
+    expected = name if name == "E" * 128 else "Exception"
+    public = _safe_provider_execution_error("fixture", "model", "embed", error)
+    restored = pickle.loads(pickle.dumps(public))
+    assert summarize_error(error) == summarize_error(restored) == expected
+
+
+@pytest.mark.parametrize("name", ["E" * 129, "Error错误"])
+def test_transport_does_not_accept_a_partial_type_name(name):
+    assert summarize_error(RuntimeError(f"upstream error: {name} (errno=5)")) == "ProviderError"
 
 
 @pytest.mark.parametrize(
